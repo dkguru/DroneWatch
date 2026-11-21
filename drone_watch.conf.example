@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: CC-BY-ND-4.0
+# Drone Watch settings
+# Copy to /etc/drone_watch.conf and protect it (it holds your mail password):
+#   sudo cp drone_watch.conf.example /etc/drone_watch.conf
+#   sudo chmod 600 /etc/drone_watch.conf
+# Restart after every change:  sudo systemctl restart drone-watch
+
+[home]
+# Centre of your property (right-click it in Google Maps / OpenStreetMap to copy)
+lat = 45.4100
+lon = -122.7000
+# Radius in metres that counts as "my home area"
+radius_m = 100
+
+[alerts]
+# Send an email when a NEW drone enters the home area (yes / no)
+enabled = yes
+# A drone counts as new if it has NOT been inside the home area during this
+# many minutes. A drone that keeps hovering sends one email; if it leaves and
+# comes back after this long, it sends another.
+new_after_minutes = 30
+# Location often arrives before the drone's serial number. Wait up to this
+# many seconds for the serial so the email can include it.
+wait_for_id_seconds = 15
+
+[email]
+# Gmail: smtp.gmail.com, port 587, starttls, and an App Password
+#   (Google Account > Security > 2-Step Verification > App passwords).
+# Outlook/Microsoft 365: smtp.office365.com, port 587, starttls.
+# Port 465 providers: set security = ssl.
+smtp_host = smtp.gmail.com
+smtp_port = 587
+security = starttls
+username = you@example.com
+password = your-app-password
+from = Drone Watch <you@example.com>
+# One or more recipients, separated by commas
+to = you@example.com
+# Optional: link to the dashboard included in each email
+dashboard_url = http://10.4.27.220/

@@ -1,0 +1,19 @@
+# Your real settings (contains your mail password and home location) - never commit
+drone_watch.conf
+/etc/
+
+# Runtime data written by the scanner
+*.db
+*.db-journal
+status.json
+status.json.tmp
+*.csv
+
+# Python / editor clutter
+__pycache__/
+*.pyc
+.venv/
+.vscode/
+.idea/
+*.swp
+.DS_Store

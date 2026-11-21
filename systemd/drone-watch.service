@@ -1,0 +1,26 @@
+# Drone Watch - systemd service
+# Install:  sudo cp systemd/drone-watch.service /etc/systemd/system/
+#           sudo systemctl daemon-reload && sudo systemctl enable --now drone-watch
+# Settings (home location, radius, email) are read from /etc/drone_watch.conf.
+
+[Unit]
+Description=Drone Watch Remote ID scanner
+After=bluetooth.target network.target
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+# Wi-Fi adapter only (remove these four lines and "--wifi wlan1" if you use Bluetooth only).
+# Use the USB adapter's name everywhere; the built-in wlan0 cannot do monitor mode.
+# The "-" lets the scanner still start with Bluetooth if a Wi-Fi step fails.
+ExecStartPre=-/usr/bin/nmcli device set wlan1 managed no
+ExecStartPre=-/usr/sbin/ip link set wlan1 down
+ExecStartPre=-/usr/sbin/iw dev wlan1 set type monitor
+ExecStartPre=-/usr/sbin/ip link set wlan1 up
+ExecStart=/usr/bin/python3 /opt/drone_watch/drone_watch.py --config /etc/drone_watch.conf --wifi wlan1
+Environment=DRONE_WATCH_DIR=/var/lib/drone_watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
