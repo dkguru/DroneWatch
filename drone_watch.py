@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: CC-BY-ND-4.0
-# Copyright (c) 2026 Jesper Angelo <jesper@angelo.net>
+# Copyright (c) 2026 Kianna Angelo and Jesper Angelo <kj@angelo.net>
+# Idea by Kianna Angelo
 # https://github.com/dkguru/DroneWatch
 """
 drone_watch.py - Remote ID drone monitor for Raspberry Pi.

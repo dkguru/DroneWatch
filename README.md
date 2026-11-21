@@ -15,7 +15,8 @@ the police or the FAA.
 | `LICENSE` | CC BY-ND 4.0 license. |
 
 Repository: https://github.com/dkguru/DroneWatch
-Author: Jesper Angelo, jesper@angelo.net. Copyright notice: https://dkguru.wordpress.com/copyright/
+Authors: Kianna Angelo and Jesper Angelo, kj@angelo.net. Idea by Kianna Angelo.
+Copyright notice: https://dkguru.wordpress.com/copyright/
 License: [CC BY-ND 4.0](https://creativecommons.org/licenses/by-nd/4.0/). See section 10.
 
 ---
@@ -525,7 +526,8 @@ stops the scanner.
 
 ## 10. License
 
-Copyright (c) 2026 Jesper Angelo, jesper@angelo.net.
+Copyright (c) 2026 Kianna Angelo and Jesper Angelo, kj@angelo.net.
+Idea by Kianna Angelo.
 See https://dkguru.wordpress.com/copyright/.
 
 Drone Watch is licensed under the **Creative Commons Attribution-NoDerivatives
@@ -537,7 +539,7 @@ The full legal text is in [`LICENSE`](LICENSE).
 - copy it and share it unchanged
 
 **As long as you:**
-- credit Jesper Angelo
+- credit Kianna Angelo and Jesper Angelo
 - link to the license
 - link to this repository
 

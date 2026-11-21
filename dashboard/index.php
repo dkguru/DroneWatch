@@ -1,6 +1,7 @@
 <?php
 // SPDX-License-Identifier: CC-BY-ND-4.0
-// Copyright (c) 2026 Jesper Angelo <jesper@angelo.net>
+// Copyright (c) 2026 Kianna Angelo and Jesper Angelo <kj@angelo.net>
+// Idea by Kianna Angelo
 // https://github.com/dkguru/DroneWatch
 /*
  * Drone Watch dashboard - live web view of drone_watch.py
