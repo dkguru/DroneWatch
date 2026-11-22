@@ -43,6 +43,8 @@ import time
 from datetime import datetime
 
 import configparser
+import html
+import re
 import json
 import smtplib
 import ssl
@@ -52,6 +54,8 @@ from email.message import EmailMessage
 DATA_DIR = os.environ.get("DRONE_WATCH_DIR", "/var/lib/drone_watch")
 DB_PATH = os.path.join(DATA_DIR, "drone_watch.db")
 STATUS_PATH = os.path.join(DATA_DIR, "status.json")
+REQUEST_DIR = os.path.join(DATA_DIR, "requests")   # dashboard drops report requests here
+RESULT_DIR = os.path.join(DATA_DIR, "results")     # scanner writes the outcome here
 ODID_UUID = "0000fffa-0000-1000-8000-00805f9b34fb"
 ODID_APP_CODE = 0x0D
 WIFI_OUI = bytes.fromhex("FA0BBC")          # ASTM F3411 Wi-Fi OUI
@@ -186,8 +190,8 @@ def load_config(path):
     return cfg
 
 
-def send_email(cfg, subject, body):
-    """Send one plain-text email using the [email] section. Raises on failure."""
+def send_email(cfg, subject, body, html_body=None):
+    """Send an email (plain text, plus optional HTML) using the [email] section. Raises on failure."""
     e = cfg["email"]
     recipients = [x.strip() for x in e.get("to").split(",") if x.strip()]
     if not e.get("smtp_host") or not recipients:
@@ -197,6 +201,8 @@ def send_email(cfg, subject, body):
     msg["From"] = e.get("from") or e.get("username")
     msg["To"] = ", ".join(recipients)
     msg.set_content(body)
+    if html_body:
+        msg.add_alternative(html_body, subtype="html")
     host, port, sec = e.get("smtp_host"), e.getint("smtp_port"), e.get("security").lower()
     ctx = ssl.create_default_context()
     if sec == "ssl":
@@ -313,6 +319,311 @@ class Alerter:
             print(f"[alert] email FAILED for {key}: {exc}", file=sys.stderr, flush=True)
 
 
+# --------------------------------------------------------------------------
+# Settings shown on the dashboard (the mail password is never included)
+# --------------------------------------------------------------------------
+def public_config(cfg, path, home, radius, wifi, ble):
+    e, a = cfg["email"], cfg["alerts"]
+    return {
+        "config_file": path if path and os.path.exists(path) else f"{path} (not found, using defaults)",
+        "data_dir": DATA_DIR,
+        "receivers": {"bluetooth": ble, "wifi": wifi or "off"},
+        "home": {"lat": home[0] if home else None, "lon": home[1] if home else None,
+                 "radius_m": radius},
+        "alerts": {"enabled": a.getboolean("enabled"),
+                   "new_after_minutes": a.getfloat("new_after_minutes"),
+                   "wait_for_id_seconds": a.getfloat("wait_for_id_seconds")},
+        "email": {"smtp_host": e.get("smtp_host"), "smtp_port": e.get("smtp_port"),
+                  "security": e.get("security"), "username": e.get("username"),
+                  "password": "set (hidden)" if e.get("password") else "not set",
+                  "from": e.get("from"), "to": e.get("to"),
+                  "dashboard_url": e.get("dashboard_url")},
+    }
+
+
+# --------------------------------------------------------------------------
+# Emailed sighting reports, requested from the dashboard
+# --------------------------------------------------------------------------
+REQUEST_ID = re.compile(r"[a-f0-9]{24}")
+DRONE_KEY = re.compile(r"[A-Za-z0-9 :._-]{1,40}")
+REPORTS_PER_HOUR = 20
+
+
+def _fmt_dur(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds} s"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m} min {s:02d} s"
+    h, m = divmod(m, 60)
+    return f"{h} h {m:02d} min"
+
+
+def _num(v, unit, digits=0):
+    return "–" if v is None else f"{v:.{digits}f} {unit}"
+
+
+def collect_visits(rows, gap_seconds):
+    """Group sightings (sorted by time) into visits split by gaps longer than gap_seconds."""
+    visits, cur = [], None
+    for r in rows:
+        t = datetime.fromisoformat(r["ts"])
+        if cur is None or (t - cur["end"]).total_seconds() > gap_seconds:
+            cur = {"start": t, "end": t, "rows": []}
+            visits.append(cur)
+        cur["end"] = t
+        cur["rows"].append(r)
+    for v in visits:
+        rs = v["rows"]
+        dists = [r for r in rs if r["dist_home_m"] is not None]
+        closest = min(dists, key=lambda r: r["dist_home_m"]) if dists else None
+        ops = [r for r in rs if r["op_lat"] is not None]
+        v.update(
+            duration=(v["end"] - v["start"]).total_seconds(),
+            samples=len(rs),
+            closest=closest["dist_home_m"] if closest else None,
+            closest_pos=(closest["lat"], closest["lon"]) if closest and closest["lat"] else None,
+            max_height=max((r["height_m"] for r in rs if r["height_m"] is not None), default=None),
+            max_speed=max((r["speed_ms"] for r in rs if r["speed_ms"] is not None), default=None),
+            inside=any(r["inside_radius"] for r in rs),
+            operator=(ops[-1]["op_lat"], ops[-1]["op_lon"]) if ops else None,
+        )
+    return visits
+
+
+def build_report(db, lock, key, cfg):
+    """Return (subject, text, html) for one drone, or raise LookupError."""
+    with lock:
+        cur = db.execute("""SELECT ts, lat, lon, dist_home_m, height_m, speed_ms, inside_radius,
+                                   op_lat, op_lon, manufacturer, ua_type, id_type, self_id,
+                                   operator_id, source, rssi
+                            FROM sightings WHERE uas_id = ? ORDER BY ts""", (key,))
+        cols = [c[0] for c in cur.description]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    if not rows:
+        raise LookupError(f"no sightings logged for {key}")
+
+    gap = cfg["alerts"].getfloat("new_after_minutes") * 60
+    visits = collect_visits(rows, gap)
+    latest, previous = visits[-1], list(reversed(visits[:-1]))
+
+    def last(field):
+        return next((r[field] for r in reversed(rows) if r[field]), None)
+
+    maker, ua_type = last("manufacturer") or "Unknown maker", last("ua_type") or "–"
+    notes, op_id, id_type = last("self_id"), last("operator_id"), last("id_type") or "–"
+    inside_count = sum(1 for v in visits if v["inside"])
+    when = latest["start"].strftime("%a %d %b %Y, %H:%M")
+    subject = f"Drone sighting report: {maker} {key} ({when})"
+    dash = cfg["email"].get("dashboard_url")
+    now_txt = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # ---------- plain-text version ----------
+    t = [f"DRONE WATCH - SIGHTING REPORT ({now_txt})", "",
+         f"Remote ID:    {key} ({id_type})", f"Maker/type:   {maker} / {ua_type}"]
+    if notes:
+        t.append(f"Pilot's note: {notes}")
+    if op_id:
+        t.append(f"Operator ID:  {op_id}")
+    t += ["", "LATEST SIGHTING",
+          f"  When:            {latest['start']:%Y-%m-%d %H:%M:%S} - {latest['end']:%H:%M:%S} ({_fmt_dur(latest['duration'])})",
+          f"  Closest to home: {_num(latest['closest'], 'm')}",
+          f"  Max height:      {_num(latest['max_height'], 'm')}",
+          f"  Max speed:       {_num(latest['max_speed'], 'm/s', 1)}",
+          f"  Home area:       {'ENTERED' if latest['inside'] else 'not entered'}"]
+    if latest["closest_pos"]:
+        t.append(f"  Closest point:   {maps_link(*latest['closest_pos'])}")
+    if latest["operator"]:
+        t.append(f"  Operator:        {maps_link(*latest['operator'])}")
+    t += ["", f"TOTALS: {len(visits)} sighting(s) since {visits[0]['start']:%Y-%m-%d}, "
+              f"{inside_count} inside the home area", "", "PREVIOUS SIGHTINGS"]
+    if previous:
+        for v in previous[:50]:
+            t.append(f"  {v['start']:%Y-%m-%d %H:%M}  {_fmt_dur(v['duration']):>12}  "
+                     f"closest {_num(v['closest'], 'm'):>7}  max {_num(v['max_height'], 'm'):>6}"
+                     f"{'  INSIDE' if v['inside'] else ''}")
+    else:
+        t.append("  None - this is the first time this drone has been logged.")
+    if dash:
+        t += ["", f"Live dashboard: {dash}"]
+    t += ["", "Owner identity is not part of the Remote ID broadcast. Police can look up",
+          "the serial through the FAA (DiSCVR) if you report the flight."]
+
+    # ---------- HTML version (inline styles: email clients ignore <style>) ----------
+    E = html.escape
+    accent, alert, dim, line = "#14b88a", "#e5484d", "#6b7a78", "#e6ecea"
+
+    def link(pos, label):
+        return f'<a href="{E(maps_link(*pos))}" style="color:{accent};text-decoration:none">{E(label)}</a>' if pos else "–"
+
+    def stat(label, value, colour="#0d1417"):
+        return (f'<td style="padding:14px 10px;text-align:center;border-right:1px solid {line}">'
+                f'<div style="font-size:22px;font-weight:700;color:{colour}">{E(value)}</div>'
+                f'<div style="font-size:10px;letter-spacing:1.5px;color:{dim};margin-top:4px">{E(label)}</div></td>')
+
+    def kv(label, value_html):
+        return (f'<tr><td style="padding:7px 0;color:{dim};font-size:13px;width:150px">{E(label)}</td>'
+                f'<td style="padding:7px 0;font-size:13px">{value_html}</td></tr>')
+
+    badge = (f'<span style="background:{alert};color:#fff;border-radius:4px;padding:3px 8px;'
+             f'font-size:11px;letter-spacing:1px">ENTERED HOME AREA</span>' if latest["inside"] else
+             f'<span style="background:{line};color:{dim};border-radius:4px;padding:3px 8px;'
+             f'font-size:11px;letter-spacing:1px">PASSED NEARBY</span>')
+
+    yes_html = f'<b style="color:{alert}">Yes</b>'
+    prev_rows = "".join(
+        f'<tr style="border-top:1px solid {line}">'
+        f'<td style="padding:8px 6px">{v["start"]:%d %b %Y}<br><span style="color:{dim}">{v["start"]:%H:%M}</span></td>'
+        f'<td style="padding:8px 6px">{E(_fmt_dur(v["duration"]))}</td>'
+        f'<td style="padding:8px 6px">{E(_num(v["closest"], "m"))}</td>'
+        f'<td style="padding:8px 6px">{E(_num(v["max_height"], "m"))}</td>'
+        f'<td style="padding:8px 6px">{yes_html if v["inside"] else "No"}</td>'
+        f'<td style="padding:8px 6px">{link(v["operator"], "map")}</td></tr>'
+        for v in previous[:50])
+    if not previous:
+        prev_rows = (f'<tr><td colspan="6" style="padding:14px 6px;color:{dim}">None. This is the first '
+                     f'time this drone has been logged.</td></tr>')
+    more = (f'<p style="color:{dim};font-size:12px">Showing the 50 most recent of {len(previous)} previous sightings.</p>'
+            if len(previous) > 50 else "")
+
+    details = "".join([
+        kv("Remote ID", f'<b style="font-family:Menlo,Consolas,monospace">{E(key)}</b> <span style="color:{dim}">({E(id_type)})</span>'),
+        kv("Maker / type", E(f"{maker} / {ua_type}")),
+        kv("Pilot's note", E(notes)) if notes else "",
+        kv("Operator ID", E(op_id)) if op_id else "",
+        kv("When", E(f"{latest['start']:%A %d %B %Y}, {latest['start']:%H:%M:%S} – {latest['end']:%H:%M:%S}")),
+        kv("Closest point", link(latest["closest_pos"], "Open in map")),
+        kv("Operator / takeoff", link(latest["operator"], "Open in map")),
+    ])
+
+    html_body = f"""<!DOCTYPE html><html><body style="margin:0;padding:0;background:#f3f6f5">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f3f6f5;padding:24px 0">
+<tr><td align="center">
+<table role="presentation" width="640" cellspacing="0" cellpadding="0" style="max-width:640px;width:100%;background:#ffffff;border-radius:12px;overflow:hidden;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#0d1417">
+  <tr><td style="background:#070b0d;padding:22px 28px">
+    <div style="color:#2ef2b4;font-size:12px;letter-spacing:4px">&#9673; DRONE WATCH</div>
+    <div style="color:#ffffff;font-size:22px;font-weight:600;margin-top:6px">Sighting report</div>
+    <div style="color:#8fa9a5;font-size:13px;margin-top:4px">{E(maker)} &middot; {E(key)} &middot; generated {E(now_txt)}</div>
+  </td></tr>
+  <tr><td style="padding:22px 28px 6px">{badge}
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-top:14px">{details}</table>
+  </td></tr>
+  <tr><td style="padding:10px 28px">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border:1px solid {line};border-radius:10px">
+      <tr>{stat("CLOSEST", _num(latest["closest"], "m"), alert if latest["inside"] else "#0d1417")}
+          {stat("MAX HEIGHT", _num(latest["max_height"], "m"))}
+          {stat("MAX SPEED", _num(latest["max_speed"], "m/s", 1))}
+          <td style="padding:14px 10px;text-align:center">
+            <div style="font-size:22px;font-weight:700">{E(_fmt_dur(latest["duration"]))}</div>
+            <div style="font-size:10px;letter-spacing:1.5px;color:{dim};margin-top:4px">DURATION</div></td></tr>
+    </table>
+  </td></tr>
+  <tr><td style="padding:12px 28px 0;font-size:13px;color:{dim}">
+    Seen <b style="color:#0d1417">{len(visits)}</b> time(s) since {visits[0]['start']:%d %b %Y},
+    <b style="color:{alert if inside_count else '#0d1417'}">{inside_count}</b> inside the home area.
+  </td></tr>
+  <tr><td style="padding:18px 28px 6px">
+    <div style="font-size:11px;letter-spacing:2px;color:{dim};margin-bottom:6px">PREVIOUS SIGHTINGS</div>
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-size:12px">
+      <tr style="color:{dim};font-size:10px;letter-spacing:1px;text-align:left">
+        <th style="padding:6px;font-weight:500">DATE</th><th style="padding:6px;font-weight:500">DURATION</th>
+        <th style="padding:6px;font-weight:500">CLOSEST</th><th style="padding:6px;font-weight:500">MAX HT</th>
+        <th style="padding:6px;font-weight:500">INSIDE</th><th style="padding:6px;font-weight:500">OPERATOR</th></tr>
+      {prev_rows}
+    </table>{more}
+  </td></tr>
+  {f'<tr><td style="padding:14px 28px"><a href="{E(dash)}" style="display:inline-block;background:#070b0d;color:#2ef2b4;text-decoration:none;padding:10px 18px;border-radius:6px;font-size:13px;letter-spacing:1px">OPEN LIVE DASHBOARD</a></td></tr>' if dash else ''}
+  <tr><td style="padding:18px 28px 24px;font-size:11px;color:{dim};border-top:1px solid {line}">
+    Owner identity is not part of the Remote ID broadcast. To report the flight, give the serial number,
+    times and operator location to local police, who can look up the owner through the FAA (DiSCVR).<br><br>
+    Drone Watch &copy; 2026 Kianna Angelo and Jesper Angelo &middot; CC BY-ND 4.0
+  </td></tr>
+</table></td></tr></table></body></html>"""
+    return subject, "\n".join(t), html_body
+
+
+class ReportService:
+    """
+    Picks up report requests the dashboard drops in REQUEST_DIR, emails the
+    report to the configured recipients, and writes the outcome to RESULT_DIR.
+    Reports only ever go to the [email] 'to' addresses, so the dashboard
+    cannot be used to send mail anywhere else.
+    """
+
+    def __init__(self, tracker, cfg):
+        self.tracker, self.cfg = tracker, cfg
+        self.sent = []          # timestamps, for the hourly limit
+        for d, mode in ((REQUEST_DIR, 0o1733), (RESULT_DIR, 0o755)):
+            os.makedirs(d, exist_ok=True)
+            os.chmod(d, mode)   # 1733: the web server may drop files but not list or delete others
+
+    def poll(self):
+        try:
+            names = os.listdir(REQUEST_DIR)
+        except OSError:
+            return
+        for name in names:
+            path = os.path.join(REQUEST_DIR, name)
+            rid = name[:-5] if name.endswith(".json") else None
+            if not rid:
+                if name.endswith(".tmp") and time.time() - os.path.getmtime(path) > 60:
+                    os.remove(path)                 # abandoned half-written request
+                continue
+            try:
+                with open(path) as f:
+                    req = json.load(f)
+            except (OSError, ValueError):
+                req = None
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            if not REQUEST_ID.fullmatch(rid):
+                continue
+            key = (req or {}).get("drone", "")
+            if not isinstance(key, str) or not DRONE_KEY.fullmatch(key):
+                self._result(rid, False, "invalid drone id")
+                continue
+            now = time.time()
+            self.sent = [t for t in self.sent if now - t < 3600]
+            if len(self.sent) >= REPORTS_PER_HOUR:
+                self._result(rid, False, f"limit of {REPORTS_PER_HOUR} reports per hour reached")
+                continue
+            self.sent.append(now)
+            threading.Thread(target=self._send, args=(rid, key), daemon=True).start()
+        self._clean_results()
+
+    def _send(self, rid, key):
+        try:
+            subject, text, html_body = build_report(self.tracker.db, self.tracker.lock, key, self.cfg)
+            send_email(self.cfg, subject, text, html_body)
+            to = self.cfg["email"].get("to")
+            print(f"[report] {key} emailed to {to}", flush=True)
+            self._result(rid, True, f"sent to {to}")
+        except Exception as exc:
+            print(f"[report] {key} FAILED: {exc}", file=sys.stderr, flush=True)
+            self._result(rid, False, str(exc))
+
+    @staticmethod
+    def _result(rid, ok, message):
+        tmp = os.path.join(RESULT_DIR, rid + ".tmp")
+        with open(tmp, "w") as f:
+            json.dump({"ok": ok, "message": message, "time": time.time()}, f)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, os.path.join(RESULT_DIR, rid + ".json"))
+
+    @staticmethod
+    def _clean_results():
+        for name in os.listdir(RESULT_DIR):
+            p = os.path.join(RESULT_DIR, name)
+            try:
+                if time.time() - os.path.getmtime(p) > 3600:
+                    os.remove(p)
+            except OSError:
+                pass
+
+
 class Tracker:
     def __init__(self, home, radius, db_path, cfg=None):
         self.home, self.radius = home, radius
@@ -332,6 +643,7 @@ class Tracker:
         os.chmod(db_path, 0o644)  # let the web server read it
         self._last_log = {}
         self.alerter = Alerter(cfg or load_config(None), self.db)
+        self.public_config = {}      # safe copy of the settings for the dashboard (no password)
 
     def update(self, mac, source, rssi, fields):
         if not fields:
@@ -369,7 +681,7 @@ class Tracker:
                     if now - d["last_seen"] < STALE_AFTER]
         status = {"heartbeat": now, "started": self.started, "pid": os.getpid(),
                   "sources": sources, "home": self.home, "radius": self.radius,
-                  "drones": live}
+                  "drones": live, "config": self.public_config}
         tmp = STATUS_PATH + ".tmp"
         with open(tmp, "w") as f:
             json.dump(status, f)
@@ -499,6 +811,8 @@ def main():
         home = None
     radius = a.radius if a.radius is not None else cfg["home"].getfloat("radius_m")
     tracker = Tracker(home, radius, DB_PATH, cfg)
+    tracker.public_config = public_config(cfg, a.config, home, radius, a.wifi, not a.no_ble)
+    reports = ReportService(tracker, cfg)
     print(f"Home {home}, radius {radius} m, email alerts "
           f"{'ON' if tracker.alerter.enabled else 'off'} "
           f"(new after {tracker.alerter.window / 60:g} min)", flush=True)
@@ -514,6 +828,7 @@ def main():
             tasks.append(asyncio.create_task(ble_scan(tracker)))
         while True:
             tracker.write_status(sources)
+            reports.poll()
             if sys.stdout.isatty():
                 tracker.render()
             await asyncio.sleep(2)

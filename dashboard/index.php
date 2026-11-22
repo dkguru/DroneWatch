@@ -19,6 +19,8 @@
 $DATA_DIR    = getenv('DRONE_WATCH_DIR') ?: '/var/lib/drone_watch';
 $DB_PATH     = "$DATA_DIR/drone_watch.db";
 $STATUS_PATH = "$DATA_DIR/status.json";
+$REQUEST_DIR = "$DATA_DIR/requests";   // report requests for the scanner to email
+$RESULT_DIR  = "$DATA_DIR/results";    // the scanner's answer to each request
 $OFFLINE_AFTER = 10; // seconds without a heartbeat before we call the scanner offline
 
 function db() {
@@ -90,6 +92,57 @@ if ($api === 'history') {
         $rows = $q->fetchAll(PDO::FETCH_ASSOC);
     }
     json_out($rows);
+}
+
+if ($api === 'config') {
+    // The scanner publishes its settings in status.json without the mail password.
+    $status = is_readable($STATUS_PATH) ? json_decode(file_get_contents($STATUS_PATH), true) : null;
+    json_out([
+        'scanner'   => $status['config'] ?? null,
+        'running'   => $status && (microtime(true) - $status['heartbeat']) < $OFFLINE_AFTER,
+        'dashboard' => [
+            'php_version'   => PHP_VERSION,
+            'sqlite_driver' => extension_loaded('pdo_sqlite') ? 'installed' : 'MISSING (sudo apt install php-sqlite3)',
+            'database'      => is_readable($DB_PATH) ? $DB_PATH : "$DB_PATH (not readable)",
+            'report_queue'  => is_writable($REQUEST_DIR) ? 'ready' : "$REQUEST_DIR not writable (restart the scanner)",
+        ],
+    ]);
+}
+
+if ($api === 'report') {
+    // Ask the scanner to email a sighting report. POST + custom header so a link,
+    // prefetch or another website can't trigger it. Mail only goes to the
+    // recipients in the scanner's config, never to an address given here.
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST' || ($_SERVER['HTTP_X_DRONEWATCH'] ?? '') !== '1') {
+        http_response_code(405);
+        json_out(['error' => 'use the button on the dashboard']);
+    }
+    $drone = (string)(json_decode(file_get_contents('php://input'), true)['drone'] ?? '');
+    if (!preg_match('/^[A-Za-z0-9 :._-]{1,40}$/', $drone)) {
+        http_response_code(400);
+        json_out(['error' => 'invalid drone id']);
+    }
+    $status = is_readable($STATUS_PATH) ? json_decode(file_get_contents($STATUS_PATH), true) : null;
+    if (!$status || (microtime(true) - $status['heartbeat']) >= $OFFLINE_AFTER) {
+        http_response_code(503);
+        json_out(['error' => 'the scanner is offline, and it is the scanner that sends the email']);
+    }
+    if (!is_writable($REQUEST_DIR)) {
+        http_response_code(503);
+        json_out(['error' => 'report queue not available; restart the scanner to create it']);
+    }
+    $id = bin2hex(random_bytes(12));
+    $tmp = "$REQUEST_DIR/$id.tmp";
+    file_put_contents($tmp, json_encode(['drone' => $drone, 'requested' => time()]));
+    rename($tmp, "$REQUEST_DIR/$id.json");
+    json_out(['id' => $id]);
+}
+
+if ($api === 'report_status') {
+    $id = (string)($_GET['id'] ?? '');
+    if (!preg_match('/^[a-f0-9]{24}$/', $id)) json_out(['error' => 'invalid id']);
+    $file = "$RESULT_DIR/$id.json";
+    json_out(is_readable($file) ? json_decode(file_get_contents($file), true) : ['pending' => true]);
 }
 
 if ($api === 'csv') {
@@ -170,6 +223,27 @@ if ($api === 'csv') {
   .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px 12px; margin-top: 8px; font-size: 12px; }
   .grid div span { display: block; color: var(--dim); font-size: 10px; letter-spacing: .1em; }
   .empty { padding: 40px 14px; text-align: center; color: var(--dim); }
+  .mail-btn { background: transparent; color: var(--accent); border: 1px solid #2ef2b455; border-radius: 5px;
+              font: inherit; font-size: 10px; letter-spacing: .1em; padding: 3px 8px; cursor: pointer; white-space: nowrap; }
+  .mail-btn:hover { background: #2ef2b415; border-color: var(--accent); }
+  .mail-btn:disabled { cursor: default; opacity: .8; }
+  .mail-btn.ok { color: var(--accent); border-color: var(--accent); }
+  .mail-btn.fail { color: var(--alert); border-color: var(--alert); }
+  .cfg-btn { margin-top: 10px; background: transparent; color: var(--dim); border: 1px solid var(--line);
+             border-radius: 5px; font: inherit; font-size: 10px; letter-spacing: .12em; padding: 4px 10px; cursor: pointer; }
+  .cfg-btn:hover { color: var(--text); border-color: var(--dim); }
+  #cfg-modal { position: fixed; inset: 0; background: #000b; display: none; align-items: center;
+               justify-content: center; z-index: 2000; padding: 16px; }
+  #cfg-modal.open { display: flex; }
+  #cfg-modal .box { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+                    width: min(640px, 100%); max-height: 85vh; overflow-y: auto; }
+  #cfg-modal h3 { margin: 0; padding: 12px 16px; font-size: 11px; letter-spacing: .2em; color: var(--dim);
+                  font-weight: 500; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; }
+  #cfg-modal h3 button { background: none; border: 0; color: var(--dim); font-size: 16px; cursor: pointer; }
+  #cfg-modal h4 { margin: 14px 16px 4px; font-size: 10px; letter-spacing: .2em; color: var(--accent); font-weight: 500; }
+  #cfg-modal table td { white-space: normal; word-break: break-word; }
+  #cfg-modal table td:first-child { color: var(--dim); width: 42%; }
+  #cfg-modal .note { padding: 10px 16px 16px; font-size: 11px; color: var(--dim); }
 
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
@@ -180,6 +254,8 @@ if ($api === 'csv') {
   select, a.btn { background: #000; color: var(--text); border: 1px solid var(--line); border-radius: 6px;
                   padding: 3px 8px; font: inherit; font-size: 11px; text-decoration: none; }
   footer { padding: 4px 22px 22px; color: var(--dim); font-size: 11px; }
+  .copyright { margin-top: 10px; font-size: 10px; opacity: .6; letter-spacing: .03em; }
+  .copyright a { color: inherit; }
   .leaflet-container { font: inherit; background: #000; }
   .dark-tiles { filter: invert(1) hue-rotate(180deg) brightness(.85) contrast(.9) saturate(.6); }
   .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: var(--panel); color: var(--text); }
@@ -220,22 +296,40 @@ if ($api === 'csv') {
     </h2>
     <div class="tbl"><table>
       <thead><tr><th>REMOTE ID</th><th>MAKER</th><th>TYPE</th><th>FIRST SEEN</th><th>LAST SEEN</th>
-        <th>HITS</th><th>CLOSEST</th><th>MAX HEIGHT</th><th>OPERATOR LOCATION</th><th>NOTE</th></tr></thead>
+        <th>HITS</th><th>CLOSEST</th><th>MAX HEIGHT</th><th>OPERATOR LOCATION</th><th>NOTE</th><th>REPORT</th></tr></thead>
       <tbody id="hist"></tbody>
     </table></div>
   </section>
 </main>
 <footer>Owner identity is not part of the Remote ID broadcast. Give the serial number, times and operator
-location to local police, who can query the FAA. Rows in red came inside your alert radius.</footer>
+location to local police, who can query the FAA. Rows in red came inside your alert radius.
+<div class="copyright">© 2026 Kianna Angelo and Jesper Angelo · Idea by Kianna Angelo ·
+<a href="https://creativecommons.org/licenses/by-nd/4.0/" target="_blank" rel="noopener">CC BY-ND 4.0</a> ·
+<a href="https://github.com/dkguru/DroneWatch" target="_blank" rel="noopener">github.com/dkguru/DroneWatch</a></div>
+<button class="cfg-btn" id="cfg-open">SHOW CONFIGURATION</button>
+</footer>
+
+<div id="cfg-modal" role="dialog" aria-modal="true" aria-labelledby="cfg-title">
+  <div class="box">
+    <h3><span id="cfg-title">CONFIGURATION</span><button id="cfg-close" aria-label="Close">✕</button></h3>
+    <div id="cfg-body"><div class="empty">Loading…</div></div>
+    <div class="note">Read-only. To change settings, edit <code>/etc/drone_watch.conf</code> on the Pi and run
+      <code>sudo systemctl restart drone-watch</code>. The mail password is never shown.</div>
+  </div>
+</div>
 
 <script>
 const $ = id => document.getElementById(id);
 const fmt = (v, u = "", d = 0) => v == null ? "–" : Number(v).toFixed(d) + u;
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
-const map = L.map("map", { zoomControl: true }).setView([45.41, -122.70], 16);
+// The map library loads from the internet. If it can't, the rest of the dashboard still works.
+const HAS_MAP = typeof L !== "undefined";
+if (!HAS_MAP) document.getElementById("map").innerHTML =
+  `<div class="empty">Map unavailable: this browser could not load the Leaflet map library from unpkg.com.</div>`;
+const map = HAS_MAP ? L.map("map", { zoomControl: true }).setView([45.41, -122.70], 16) : null;
 // OpenStreetMap tiles (no API key), darkened with a CSS filter to match the theme.
-L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+if (HAS_MAP) L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
   maxZoom: 19, className: "dark-tiles", attribution: "© OpenStreetMap contributors" }).addTo(map);
 
 let homeLayer = null, homeKey = null;
@@ -245,10 +339,11 @@ const droneIcon = inside => L.divIcon({ className: "", iconSize: [22, 22], iconA
   html: `<div style="width:22px;height:22px;border-radius:50%;border:2px solid ${inside ? "#ff4d5e" : "#2ef2b4"};
          box-shadow:0 0 14px ${inside ? "#ff4d5e" : "#2ef2b4"};background:#000a;display:grid;place-items:center;
          font-size:12px;color:#fff">✦</div>` });
-const opIcon = L.divIcon({ className: "", iconSize: [14, 14], iconAnchor: [7, 7],
+const opIcon = HAS_MAP && L.divIcon({ className: "", iconSize: [14, 14], iconAnchor: [7, 7],
   html: `<div style="width:14px;height:14px;transform:rotate(45deg);background:#58a6ff;box-shadow:0 0 10px #58a6ff"></div>` });
 
 function drawHome(home, radius) {
+  if (!HAS_MAP) return;
   // Redraw (and re-centre) whenever the scanner reports a different home or radius.
   const key = home ? home.join(",") + "/" + radius : null;
   if (!home || key === homeKey) return;
@@ -262,6 +357,7 @@ function drawHome(home, radius) {
 }
 
 function updateMap(drones, trails) {
+  if (!HAS_MAP) return;
   const seen = new Set();
   for (const d of drones) {
     if (d.lat == null) continue;
@@ -301,7 +397,7 @@ function updateList(drones) {
   $("live").innerHTML = drones.map(d => `
     <div class="drone ${d.inside ? "inside" : ""}" data-lat="${d.lat ?? ""}" data-lon="${d.lon ?? ""}">
       <div class="id">${esc(d.uas_id || "(waiting for ID) " + d.mac)}
-        <em>${d.inside ? "INSIDE RADIUS" : esc(d.status || "—")}</em></div>
+        <span>${d.uas_id ? mailButton(d.uas_id) + " " : ""}<em>${d.inside ? "INSIDE RADIUS" : esc(d.status || "—")}</em></span></div>
       <div class="grid">
         <div><span>MAKER</span>${esc(d.manufacturer || "–")}</div>
         <div><span>TYPE</span>${esc(d.ua_type || "–")}</div>
@@ -315,8 +411,9 @@ function updateList(drones) {
       </div>
       ${d.self_id ? `<div style="margin-top:6px;color:var(--warn)">“${esc(d.self_id)}”</div>` : ""}
     </div>`).join("");
-  document.querySelectorAll(".drone").forEach(el => el.onclick = () => {
-    if (el.dataset.lat) map.flyTo([+el.dataset.lat, +el.dataset.lon], 18);
+  document.querySelectorAll(".drone").forEach(el => el.onclick = ev => {
+    if (ev.target.closest(".mail-btn")) return;
+    if (HAS_MAP && el.dataset.lat) map.flyTo([+el.dataset.lat, +el.dataset.lon], 18);
   });
 }
 
@@ -355,7 +452,7 @@ async function poll() {
 async function loadHistory() {
   const rows = await (await fetch("?api=history&hours=" + $("hours").value)).json();
   if (rows.error) {
-    $("hist").innerHTML = `<tr><td colspan="10" class="empty">Server error: ${esc(rows.error)}</td></tr>`;
+    $("hist").innerHTML = `<tr><td colspan="11" class="empty">Server error: ${esc(rows.error)}</td></tr>`;
     return;
   }
   $("hist").innerHTML = rows.length ? rows.map(r => `
@@ -367,8 +464,87 @@ async function loadHistory() {
            href="https://www.openstreetmap.org/?mlat=${r.op_lat}&mlon=${r.op_lon}#map=18/${r.op_lat}/${r.op_lon}">
            ${(+r.op_lat).toFixed(5)}, ${(+r.op_lon).toFixed(5)}</a>` : "–"}</td>
       <td>${esc(r.self_id || "")}</td>
-    </tr>`).join("") : `<tr><td colspan="10" class="empty">Nothing logged in this period</td></tr>`;
+      <td>${mailButton(r.uas_id)}</td>
+    </tr>`).join("") : `<tr><td colspan="11" class="empty">Nothing logged in this period</td></tr>`;
 }
+
+// ----- Email report buttons -----
+// State is kept per drone so it survives the list and history re-rendering.
+const mailState = {};   // drone -> {label, cls, title, busy}
+function mailButton(drone) {
+  const st = mailState[drone] || { label: "✉ EMAIL REPORT", cls: "", title: "Email a report on this drone" };
+  return `<button class="mail-btn ${st.cls}" data-drone="${esc(drone)}" title="${esc(st.title)}"
+           ${st.busy ? "disabled" : ""}>${esc(st.label)}</button>`;
+}
+function setMail(drone, st) {
+  mailState[drone] = st;
+  document.querySelectorAll(".mail-btn").forEach(b => {
+    if (b.dataset.drone !== drone) return;
+    b.textContent = st.label; b.title = st.title; b.disabled = !!st.busy;
+    b.className = "mail-btn " + st.cls;
+  });
+}
+async function sendReport(drone) {
+  if (mailState[drone]?.busy) return;
+  setMail(drone, { label: "SENDING…", cls: "", title: "Waiting for the scanner", busy: true });
+  try {
+    const r = await (await fetch("?api=report", { method: "POST",
+      headers: { "Content-Type": "application/json", "X-DroneWatch": "1" },
+      body: JSON.stringify({ drone }) })).json();
+    if (r.error) throw new Error(r.error);
+    for (let i = 0; i < 45; i++) {               // the scanner picks it up within ~2 s
+      await new Promise(res => setTimeout(res, 1500));
+      const s = await (await fetch("?api=report_status&id=" + r.id, { cache: "no-store" })).json();
+      if (s.pending) continue;
+      if (!s.ok) throw new Error(s.message || "failed");
+      setMail(drone, { label: "✓ SENT", cls: "ok", title: s.message });
+      setTimeout(() => { delete mailState[drone]; setMail(drone, mailState[drone] ||
+        { label: "✉ EMAIL REPORT", cls: "", title: "Email a report on this drone" }); }, 60000);
+      return;
+    }
+    throw new Error("no answer from the scanner");
+  } catch (e) {
+    setMail(drone, { label: "✕ FAILED", cls: "fail", title: e.message + " (click to retry)" });
+  }
+}
+document.addEventListener("click", ev => {
+  const b = ev.target.closest(".mail-btn");
+  if (b) { ev.stopPropagation(); sendReport(b.dataset.drone); }
+});
+
+// ----- Configuration viewer -----
+function cfgSection(title, obj) {
+  if (!obj) return "";
+  const val = v => v === null || v === undefined || v === "" ? "–"
+    : typeof v === "boolean" ? (v ? "yes" : "no") : String(v);
+  return `<h4>${esc(title)}</h4><table>${Object.entries(obj).map(([k, v]) =>
+    `<tr><td>${esc(k.replace(/_/g, " "))}</td><td>${esc(val(v))}</td></tr>`).join("")}</table>`;
+}
+async function showConfig() {
+  $("cfg-modal").classList.add("open");
+  $("cfg-body").innerHTML = `<div class="empty">Loading…</div>`;
+  try {
+    const c = await (await fetch("?api=config", { cache: "no-store" })).json();
+    if (c.error) throw new Error(c.error);
+    const s = c.scanner;
+    $("cfg-body").innerHTML = s ? [
+      cfgSection("SCANNER", { running: c.running, config_file: s.config_file, data_dir: s.data_dir,
+                              bluetooth: s.receivers.bluetooth, wifi: s.receivers.wifi }),
+      cfgSection("HOME AREA", s.home),
+      cfgSection("ALERTS", s.alerts),
+      cfgSection("EMAIL", s.email),
+      cfgSection("DASHBOARD", c.dashboard),
+    ].join("") : `<div class="empty">The scanner hasn't published its settings yet.
+      Update drone_watch.py and restart it.</div>` + cfgSection("DASHBOARD", c.dashboard);
+  } catch (e) {
+    $("cfg-body").innerHTML = `<div class="empty">Could not load: ${esc(e.message)}</div>`;
+  }
+}
+const closeConfig = () => $("cfg-modal").classList.remove("open");
+$("cfg-open").onclick = showConfig;
+$("cfg-close").onclick = closeConfig;
+$("cfg-modal").onclick = ev => { if (ev.target === $("cfg-modal")) closeConfig(); };
+document.addEventListener("keydown", ev => { if (ev.key === "Escape") closeConfig(); });
 
 $("hours").onchange = loadHistory;
 setInterval(() => $("clock").textContent = new Date().toLocaleTimeString(), 1000);

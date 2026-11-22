@@ -8,7 +8,7 @@ the police or the FAA.
 | File | What it is |
 |---|---|
 | `drone_watch.py` | The scanner. It receives and decodes Remote ID, tracks drones, and writes the log and the live status. |
-| `dashboard/index.php` | The web dashboard. It shows a live map, contact list, history and CSV export, and only reads data. |
+| `dashboard/index.php` | The web dashboard. It shows a live map, contact list, history, CSV export, configuration viewer and email-report buttons. It never changes the log. |
 | `drone_watch.conf.example` | Settings template: home location, radius and email alerts. Installed as `/etc/drone_watch.conf`. |
 | `systemd/drone-watch.service` | Service file that starts the scanner at boot. |
 | `README.md` | This document. |
@@ -107,7 +107,8 @@ The goal is to **monitor and document drones that fly over my house**:
                         └──────────┬──────────────┘
                                    ▼
                        dashboard/index.php (Apache + PHP)
-                 ?api=status   ?api=history   ?api=csv   (read-only)
+          ?api=status  ?api=history  ?api=csv  ?api=config  (read-only)
+          ?api=report → requests/  ──►  scanner emails it  ──►  results/
                                    │
                                    ▼
                     Browser: map, live contacts, history
@@ -202,8 +203,14 @@ the Apache that is easy to install on a Pi, and has SQLite built in through
 PDO. One `index.php` serves both the page and its small JSON API (`?api=...`),
 so installing it is a single copy command.
 
-**The dashboard is read-only.** It opens the database with `PRAGMA query_only`
-and never writes anything, so the evidence log cannot be changed from the web.
+**The dashboard cannot change the log.** It opens the database with
+`PRAGMA query_only`, so the evidence log cannot be changed from the web.
+
+The only thing the dashboard writes is a small report request in a drop-box
+folder. That folder has mode 1733: the web server can add files but cannot
+list or delete them. The scanner, which holds the mail password, does the
+sending. This means a compromised web page can never read the password, and
+can never send mail to anyone except the configured recipients.
 User-controlled text, such as the Self-ID message a drone broadcasts, is
 HTML-escaped before display. Anyone can put anything in a broadcast, so it is
 treated as untrusted input.
@@ -291,9 +298,7 @@ Fill in:
   section 7.1.
 - **`[email]`:** your mail server and recipients.
 
-  For Gmail, use `smtp.gmail.com`, port 587, `starttls`, and an
-  **App Password** rather than your normal password. Create one under Google
-  Account > Security > 2-Step Verification > App passwords.
+  For Gmail, follow section 6.3.1 below.
 
   For Outlook or Microsoft 365, use `smtp.office365.com`, port 587,
   `starttls`. If your provider uses port 465, set `security = ssl`.
@@ -306,6 +311,89 @@ sudo python3 /opt/drone_watch/drone_watch.py --test-email
 
 `--home lat,lon` and `--radius` on the command line still work, and override
 the file.
+
+### 6.3.1 Setting up Gmail for alerts
+
+Gmail no longer accepts your normal account password from programs like
+Drone Watch. Google switched off "less secure app" sign-ins in September 2024.
+Instead you create an **App Password**: a 16-character password that only
+this program uses, and that you can revoke at any time without changing your
+real password.
+
+**1. Choose the account.** A separate Gmail account just for the Pi, such as
+`dronewatch.yourname@gmail.com`, is the safest choice. An app password gives
+full access to its mailbox, and it is stored on the Pi in plain text. If the
+Pi is ever lost or compromised, only that throwaway account is exposed. The
+alerts can still be sent *to* your normal address.
+
+**2. Turn on 2-Step Verification.** Google only offers App Passwords on
+accounts that use it.
+
+1. Sign in to the sending account and open https://myaccount.google.com/security
+2. Under *How you sign in to Google*, open **2-Step Verification** and turn
+   it on. A phone number or the Google Authenticator app is enough.
+
+**3. Create the App Password.**
+
+1. Open https://myaccount.google.com/apppasswords. Google may ask you to
+   sign in again.
+2. Under *App name*, type `Drone Watch` and click **Create**.
+3. Google shows a 16-character password in four groups, for example
+   `abcd efgh ijkl mnop`. Copy it now. Google will not show it again. If you
+   lose it, delete it and create a new one.
+
+**4. Put it in the settings file** on the Pi:
+
+```bash
+sudo nano /etc/drone_watch.conf
+```
+
+```ini
+[email]
+smtp_host = smtp.gmail.com
+smtp_port = 587
+security = starttls
+username = dronewatch.yourname@gmail.com
+password = abcdefghijklmnop
+from = Drone Watch <dronewatch.yourname@gmail.com>
+to = you@yourdomain.com, someone.else@example.com
+dashboard_url = http://<pi-address>/
+```
+
+- `password` is the App Password **without the spaces**.
+- `username` and `from` must be the account that owns the App Password.
+  Gmail rewrites a different `from` address to the account's own address
+  anyway.
+- `to` can be any addresses, Gmail or not, separated by commas.
+- If port 587 is blocked on your network, use `smtp_port = 465` and
+  `security = ssl`.
+
+Then protect the file and send a test email:
+
+```bash
+sudo chmod 600 /etc/drone_watch.conf
+sudo python3 /opt/drone_watch/drone_watch.py --test-email
+sudo systemctl restart drone-watch
+```
+
+**5. Make the alerts get noticed (optional).** In the receiving mailbox,
+create a filter for the subject `Drone over home` that applies a label, stars
+the message and marks it important. Then turn on notifications for that
+label in the Gmail phone app.
+
+**Gmail problems**
+
+| Error from `--test-email` | Cause and fix |
+|---|---|
+| `Application-specific password required` | You used the normal account password. Create an App Password (step 3). |
+| `Username and Password not accepted` (535 5.7.8) | Typo, spaces left in, or the App Password was revoked. Changing the Google account password also revokes all App Passwords. Create a new one. |
+| The *App passwords* page says the setting is not available | 2-Step Verification is off. Or the account is in Advanced Protection, or is a Google Workspace account whose administrator has disabled App Passwords. Use a personal Gmail account for the Pi instead. |
+| `Connection timed out` / `Network is unreachable` | The Pi can't reach smtp.gmail.com on that port. Check its internet access, or try port 465 with `security = ssl`. |
+| Alerts land in Spam | Mark one as *Not spam*, or add a filter that never sends `Drone over home` to Spam. |
+
+To stop the Pi sending mail at any time, delete the App Password at
+https://myaccount.google.com/apppasswords. Nothing else on the account is
+affected.
 
 ### 6.4 Test it by hand
 
@@ -429,6 +517,8 @@ sudo systemctl reload apache2
 | Task | How |
 |---|---|
 | Watch live | Open `http://<pi-address>/`. Drones inside your radius are red. Tap a contact to zoom to it. |
+| Email a report on a drone | Click **✉ EMAIL REPORT** next to the drone, in the live list or the history table. See 7.2. |
+| Check the settings | Click **SHOW CONFIGURATION** at the bottom of the dashboard. See 7.3. |
 | History in the terminal | `sudo python3 /opt/drone_watch/drone_watch.py --report` |
 | Only drones that came inside the radius | add `--inside-only` |
 | Export evidence | Click **EXPORT CSV** on the dashboard, or `sqlite3 -header -csv /var/lib/drone_watch/drone_watch.db "select * from sightings" > sightings.csv` |
@@ -475,7 +565,60 @@ Delivery results appear in `journalctl -u drone-watch`, as lines beginning
 Sending happens in the background, so a slow or failing mail server never
 stops the scanner.
 
-### 7.2 Reporting a drone
+### 7.2 Emailed sighting reports
+
+Every drone in the live list and the history table has an **✉ EMAIL REPORT**
+button. It emails a formatted report on that drone to the `to` addresses in
+`/etc/drone_watch.conf`. The report contains:
+
+- the drone's Remote ID, maker and type, plus any note or operator ID the
+  pilot broadcast
+- the latest sighting: when it happened, how long it lasted, the closest
+  distance to home, the maximum height and speed, whether it entered the home
+  area, and map links to the closest point and the operator
+- a count of how many times the drone has been seen and how many of those
+  visits came inside the home area
+- a table of **previous sightings**, newest first, up to 50, with date,
+  duration, closest distance, maximum height, whether it came inside, and the
+  operator location
+
+A "sighting" here is one visit. Log entries less than `new_after_minutes`
+apart count as the same visit, which is the same rule the email alerts use.
+
+**How it works.** The web page cannot read the mail password, because the
+settings file is readable only by root. Instead, the dashboard drops a small
+request file into `/var/lib/drone_watch/requests/`. The scanner picks it up
+within about 2 seconds, builds the report from the log and sends it. It then
+writes the result to `/var/lib/drone_watch/results/`, and the button changes
+to **✓ SENT** or **✕ FAILED**. Hover over the button to see the reason.
+
+**Safety limits:**
+- Reports only ever go to the configured `to` addresses, never to an address
+  given by the web page.
+- The button only works from the dashboard itself. It sends a POST request
+  with a custom header, so a link or another website can't trigger it.
+- At most 20 reports are sent per hour.
+- If the scanner is offline, the button says so, because the scanner is what
+  sends the email.
+
+### 7.3 Viewing the configuration
+
+**SHOW CONFIGURATION**, at the bottom of the dashboard, opens a read-only
+view of the scanner's current settings:
+
+- **Scanner:** config file, data folder, receivers
+- **Home area:** location and radius
+- **Alerts:** the alert settings
+- **Email:** the mail settings, with the password shown only as "set" or
+  "not set"
+- **Dashboard:** checks for the dashboard itself, such as the PHP SQLite
+  driver and whether the report queue is ready
+
+The scanner publishes these settings in `status.json`, with the password
+removed. To change a setting, edit `/etc/drone_watch.conf` and restart the
+scanner.
+
+### 7.4 Reporting a drone
 
 1. Filter the history to the period in question and export the CSV.
 2. Note the drone's **Remote ID serial**, the dates and times, the closest
@@ -499,7 +642,9 @@ stops the scanner.
 | Bluetooth errors on start | `sudo systemctl restart bluetooth`. Also run `rfkill list` and `sudo rfkill unblock bluetooth`. |
 | Wi-Fi sniffer sees nothing | Confirm monitor mode with `iw dev wlan1 info`, which should say "type monitor". Not all adapters support it. |
 | Map is grey | The browser has no internet access. The map tiles load from the internet. |
-| No alert emails | Run `--test-email`. Check `journalctl -u drone-watch \| grep alert`. Gmail needs an App Password. Check that `enabled = yes`. |
+| EMAIL REPORT says *report queue not available* | Restart the scanner (`sudo systemctl restart drone-watch`). It creates the queue folders when it starts. |
+| EMAIL REPORT says ✕ FAILED | Hover over the button for the reason, or check `journalctl -u drone-watch \| grep report`. Mail problems are the same as for alerts (below). |
+| No alert emails | Run `--test-email`. Check `journalctl -u drone-watch \| grep alert`. Gmail needs an App Password (see 6.3.1). Check that `enabled = yes`. |
 | Home location didn't change | Edit `/etc/drone_watch.conf`, then `sudo systemctl restart drone-watch`. A `--home` in the service file overrides the config file. |
 
 ---

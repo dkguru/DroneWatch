@@ -25,7 +25,7 @@ wait_for_id_seconds = 15
 
 [email]
 # Gmail: smtp.gmail.com, port 587, starttls, and an App Password
-#   (Google Account > Security > 2-Step Verification > App passwords).
+#   (step by step: README section 6.3.1 "Setting up Gmail for alerts").
 # Outlook/Microsoft 365: smtp.office365.com, port 587, starttls.
 # Port 465 providers: set security = ssl.
 smtp_host = smtp.gmail.com
