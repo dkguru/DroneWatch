@@ -80,7 +80,12 @@ if ($api === 'history') {
     $hours = max(1, min(24 * 90, (int)($_GET['hours'] ?? 24)));
     $rows = [];
     if ($pdo = db()) {
-        $q = $pdo->prepare("SELECT uas_id, MAX(manufacturer) AS maker, MAX(ua_type) AS ua_type,
+        // Friendly names are kept by the scanner in drone_names (missing on old scanner versions).
+        $hasNames = (bool)$pdo->query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='drone_names'")->fetchColumn();
+        $nameCol = $hasNames ? "(SELECT name FROM drone_names n WHERE n.uas_id = sightings.uas_id)" : "NULL";
+        $q = $pdo->prepare("SELECT uas_id, $nameCol AS name, MAX(id_type) AS id_type,
+                   COALESCE(MAX(CASE WHEN manufacturer NOT LIKE 'code %' THEN manufacturer END),
+                            MAX(manufacturer)) AS maker, MAX(ua_type) AS ua_type,
                    MIN(ts) AS first_seen, MAX(ts) AS last_seen, COUNT(*) AS hits,
                    MIN(dist_home_m) AS closest, MAX(height_m) AS max_height,
                    MAX(inside_radius) AS intruded, MAX(op_lat) AS op_lat, MAX(op_lon) AS op_lon,
@@ -109,33 +114,48 @@ if ($api === 'config') {
     ]);
 }
 
-if ($api === 'report') {
-    // Ask the scanner to email a sighting report. POST + custom header so a link,
-    // prefetch or another website can't trigger it. Mail only goes to the
-    // recipients in the scanner's config, never to an address given here.
+// Requests the scanner carries out: emailing a report, or renaming a drone.
+// POST + custom header so a link, prefetch or another website can't trigger them.
+// The web page never writes the database or sends mail itself.
+function queue_request(array $payload) {
+    global $STATUS_PATH, $REQUEST_DIR, $OFFLINE_AFTER;
     if ($_SERVER['REQUEST_METHOD'] !== 'POST' || ($_SERVER['HTTP_X_DRONEWATCH'] ?? '') !== '1') {
         http_response_code(405);
-        json_out(['error' => 'use the button on the dashboard']);
+        json_out(['error' => 'use the dashboard']);
     }
-    $drone = (string)(json_decode(file_get_contents('php://input'), true)['drone'] ?? '');
-    if (!preg_match('/^[A-Za-z0-9 :._-]{1,40}$/', $drone)) {
+    if (!preg_match('/^[A-Za-z0-9 :._-]{1,40}$/', $payload['drone'])) {
         http_response_code(400);
         json_out(['error' => 'invalid drone id']);
     }
     $status = is_readable($STATUS_PATH) ? json_decode(file_get_contents($STATUS_PATH), true) : null;
     if (!$status || (microtime(true) - $status['heartbeat']) >= $OFFLINE_AFTER) {
         http_response_code(503);
-        json_out(['error' => 'the scanner is offline, and it is the scanner that sends the email']);
+        json_out(['error' => 'the scanner is offline; it carries out this request']);
     }
     if (!is_writable($REQUEST_DIR)) {
         http_response_code(503);
-        json_out(['error' => 'report queue not available; restart the scanner to create it']);
+        json_out(['error' => 'request queue not available; restart the scanner to create it']);
     }
     $id = bin2hex(random_bytes(12));
     $tmp = "$REQUEST_DIR/$id.tmp";
-    file_put_contents($tmp, json_encode(['drone' => $drone, 'requested' => time()]));
+    file_put_contents($tmp, json_encode($payload + ['requested' => time()]));
     rename($tmp, "$REQUEST_DIR/$id.json");
     json_out(['id' => $id]);
+}
+
+if ($api === 'report' || $api === 'rename') {
+    $in = json_decode(file_get_contents('php://input'), true) ?: [];
+    $drone = (string)($in['drone'] ?? '');
+    if ($api === 'report') {
+        // Mail only goes to the recipients in the scanner's config, never to an address given here.
+        queue_request(['type' => 'report', 'drone' => $drone]);
+    }
+    $name = trim((string)($in['name'] ?? ''));
+    if (!preg_match('/^[^\x00-\x1F\x7F]{0,40}$/u', $name)) {
+        http_response_code(400);
+        json_out(['error' => 'names can be up to 40 characters']);
+    }
+    queue_request(['type' => 'rename', 'drone' => $drone, 'name' => $name]);
 }
 
 if ($api === 'report_status') {
@@ -232,18 +252,34 @@ if ($api === 'csv') {
   .cfg-btn { margin-top: 10px; background: transparent; color: var(--dim); border: 1px solid var(--line);
              border-radius: 5px; font: inherit; font-size: 10px; letter-spacing: .12em; padding: 4px 10px; cursor: pointer; }
   .cfg-btn:hover { color: var(--text); border-color: var(--dim); }
-  #cfg-modal { position: fixed; inset: 0; background: #000b; display: none; align-items: center;
+  .modal { position: fixed; inset: 0; background: #000b; display: none; align-items: center;
                justify-content: center; z-index: 2000; padding: 16px; }
-  #cfg-modal.open { display: flex; }
-  #cfg-modal .box { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  .modal.open { display: flex; }
+  .modal .box { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
                     width: min(640px, 100%); max-height: 85vh; overflow-y: auto; }
-  #cfg-modal h3 { margin: 0; padding: 12px 16px; font-size: 11px; letter-spacing: .2em; color: var(--dim);
+  .modal h3 { margin: 0; padding: 12px 16px; font-size: 11px; letter-spacing: .2em; color: var(--dim);
                   font-weight: 500; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; }
-  #cfg-modal h3 button { background: none; border: 0; color: var(--dim); font-size: 16px; cursor: pointer; }
-  #cfg-modal h4 { margin: 14px 16px 4px; font-size: 10px; letter-spacing: .2em; color: var(--accent); font-weight: 500; }
-  #cfg-modal table td { white-space: normal; word-break: break-word; }
-  #cfg-modal table td:first-child { color: var(--dim); width: 42%; }
-  #cfg-modal .note { padding: 10px 16px 16px; font-size: 11px; color: var(--dim); }
+  .modal h3 button { background: none; border: 0; color: var(--dim); font-size: 16px; cursor: pointer; }
+  .modal h4 { margin: 14px 16px 4px; font-size: 10px; letter-spacing: .2em; color: var(--accent); font-weight: 500; }
+  .modal table td { white-space: normal; word-break: break-word; }
+  .modal table td:first-child { color: var(--dim); width: 42%; }
+  .drone .id, #hist tr[data-drone] { cursor: pointer; }
+  #hist tr[data-drone]:hover td { background: #12201f; }
+  .drone .id > span:last-child { flex: none; white-space: nowrap; }
+  .serial { font-size: 10px; color: var(--dim); letter-spacing: .05em; margin-top: 2px; }
+  .name-row { display: flex; gap: 8px; padding: 6px 16px 4px; }
+  .name-row input { flex: 1; background: #000; color: var(--text); border: 1px solid var(--line);
+                    border-radius: 6px; padding: 7px 10px; font: inherit; font-size: 13px; }
+  .name-row input:focus { outline: none; border-color: var(--accent); }
+  .act-btn { background: transparent; color: var(--accent); border: 1px solid #2ef2b455; border-radius: 6px;
+             font: inherit; font-size: 11px; letter-spacing: .1em; padding: 6px 12px; cursor: pointer; }
+  .act-btn:hover { background: #2ef2b415; border-color: var(--accent); }
+  .act-btn.plain { color: var(--dim); border-color: var(--line); }
+  #dm-msg { padding: 2px 16px; font-size: 11px; min-height: 16px; color: var(--dim); }
+  #dm-msg.ok { color: var(--accent); } #dm-msg.fail { color: var(--alert); }
+  .dm-actions { display: flex; gap: 8px; padding: 10px 16px 16px; flex-wrap: wrap; }
+  .mono { font-family: inherit; user-select: all; color: #fff; }
+  .modal .note { padding: 10px 16px 16px; font-size: 11px; color: var(--dim); }
 
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
@@ -309,7 +345,21 @@ location to local police, who can query the FAA. Rows in red came inside your al
 <button class="cfg-btn" id="cfg-open">SHOW CONFIGURATION</button>
 </footer>
 
-<div id="cfg-modal" role="dialog" aria-modal="true" aria-labelledby="cfg-title">
+<div class="modal" id="drone-modal" role="dialog" aria-modal="true" aria-labelledby="dm-title">
+  <div class="box">
+    <h3><span id="dm-title">DRONE</span><button id="dm-close" aria-label="Close">✕</button></h3>
+    <h4>NAME</h4>
+    <div class="name-row">
+      <input id="dm-name" maxlength="40" placeholder="e.g. My Skydio 2" autocomplete="off">
+      <button class="act-btn" id="dm-save">SAVE</button>
+    </div>
+    <div id="dm-msg"></div>
+    <div id="dm-info"></div>
+    <div class="dm-actions" id="dm-actions"></div>
+  </div>
+</div>
+
+<div class="modal" id="cfg-modal" role="dialog" aria-modal="true" aria-labelledby="cfg-title">
   <div class="box">
     <h3><span id="cfg-title">CONFIGURATION</span><button id="cfg-close" aria-label="Close">✕</button></h3>
     <div id="cfg-body"><div class="empty">Loading…</div></div>
@@ -321,6 +371,9 @@ location to local police, who can query the FAA. Rows in red came inside your al
 <script>
 const $ = id => document.getElementById(id);
 const fmt = (v, u = "", d = 0) => v == null ? "–" : Number(v).toFixed(d) + u;
+// "My Skydio 2 (...W52F)" when named, otherwise the full serial.
+const names = {};       // serial -> name, from the scanner's drone_names table
+const label = (serial, name = names[serial]) => name ? `${name} (...${String(serial).slice(-4)})` : serial;
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
 // The map library loads from the internet. If it can't, the rest of the dashboard still works.
@@ -373,14 +426,15 @@ function updateMap(drones, trails) {
       };
     }
     l.drone.setLatLng(pos).setIcon(droneIcon(d.inside))
-      .bindPopup(`<b>${esc(d.uas_id || d.mac)}</b><br>${esc(d.manufacturer || "")} ${esc(d.ua_type || "")}<br>
+      .bindPopup(`<b>${esc(d.uas_id ? label(d.uas_id) : d.mac)}</b><br>
+        ${d.uas_id && names[d.uas_id] ? `<span style="opacity:.7">${esc(d.uas_id)}</span><br>` : ""}${esc(d.manufacturer || "")} ${esc(d.ua_type || "")}<br>
         Height ${fmt(d.height_m, " m")} · ${fmt(d.speed_ms, " m/s", 1)}<br>${fmt(d.dist_home_m, " m from home")}`);
     l.trail.setLatLngs(trails[d.mac] || []);
     l.trail.setStyle({ color: d.inside ? "#ff4d5e" : "#2ef2b4" });
     if (d.op_lat != null) {
       const op = [d.op_lat, d.op_lon];
       if (!l.op) l.op = L.marker(op, { icon: opIcon }).addTo(map);
-      l.op.setLatLng(op).bindTooltip("Operator / takeoff: " + esc(d.uas_id || d.mac));
+      l.op.setLatLng(op).bindTooltip("Operator / takeoff: " + esc(d.uas_id ? label(d.uas_id) : d.mac));
       l.link.setLatLngs([op, pos]);
     }
   }
@@ -391,12 +445,21 @@ function updateMap(drones, trails) {
   }
 }
 
+const liveData = {};    // serial -> latest live record, for the drone dialog
+let liveIds = new Set(); // serials in range right now
 function updateList(drones) {
+  liveIds = new Set(drones.map(d => d.uas_id).filter(Boolean));
+  for (const d of drones) if (d.uas_id) {
+    liveData[d.uas_id] = d;
+    if (d.name) names[d.uas_id] = d.name; else delete names[d.uas_id];
+  }
   if (!drones.length) { $("live").innerHTML = `<div class="empty">No drones in range</div>`; return; }
   drones.sort((a, b) => (a.dist_home_m ?? 1e9) - (b.dist_home_m ?? 1e9));
   $("live").innerHTML = drones.map(d => `
-    <div class="drone ${d.inside ? "inside" : ""}" data-lat="${d.lat ?? ""}" data-lon="${d.lon ?? ""}">
-      <div class="id">${esc(d.uas_id || "(waiting for ID) " + d.mac)}
+    <div class="drone ${d.inside ? "inside" : ""}" data-drone="${esc(d.uas_id || "")}"
+         data-lat="${d.lat ?? ""}" data-lon="${d.lon ?? ""}" title="Click for details and to rename">
+      <div class="id"><span>${esc(d.uas_id ? label(d.uas_id) : "(waiting for ID) " + d.mac)}
+        ${d.uas_id && names[d.uas_id] ? `<div class="serial">${esc(d.uas_id)}</div>` : ""}</span>
         <span>${d.uas_id ? mailButton(d.uas_id) + " " : ""}<em>${d.inside ? "INSIDE RADIUS" : esc(d.status || "—")}</em></span></div>
       <div class="grid">
         <div><span>MAKER</span>${esc(d.manufacturer || "–")}</div>
@@ -411,10 +474,7 @@ function updateList(drones) {
       </div>
       ${d.self_id ? `<div style="margin-top:6px;color:var(--warn)">“${esc(d.self_id)}”</div>` : ""}
     </div>`).join("");
-  document.querySelectorAll(".drone").forEach(el => el.onclick = ev => {
-    if (ev.target.closest(".mail-btn")) return;
-    if (HAS_MAP && el.dataset.lat) map.flyTo([+el.dataset.lat, +el.dataset.lon], 18);
-  });
+  // Clicking an entry is handled by the shared click handler below (opens the drone dialog).
 }
 
 async function poll() {
@@ -449,15 +509,20 @@ async function poll() {
   }
 }
 
+const histData = {};    // serial -> history summary row, for the drone dialog
 async function loadHistory() {
   const rows = await (await fetch("?api=history&hours=" + $("hours").value)).json();
   if (rows.error) {
     $("hist").innerHTML = `<tr><td colspan="11" class="empty">Server error: ${esc(rows.error)}</td></tr>`;
     return;
   }
+  for (const r of rows) {
+    histData[r.uas_id] = r;
+    if (r.name) names[r.uas_id] = r.name; else delete names[r.uas_id];
+  }
   $("hist").innerHTML = rows.length ? rows.map(r => `
-    <tr class="${+r.intruded ? "intr" : ""}">
-      <td>${esc(r.uas_id)}</td><td>${esc(r.maker || "–")}</td><td>${esc(r.ua_type || "–")}</td>
+    <tr class="${+r.intruded ? "intr" : ""}" data-drone="${esc(r.uas_id)}" title="${esc(r.uas_id)}: click for details and to rename">
+      <td>${esc(label(r.uas_id))}</td><td>${esc(r.maker || "–")}</td><td>${esc(r.ua_type || "–")}</td>
       <td>${esc(r.first_seen.replace("T", " "))}</td><td>${esc(r.last_seen.replace("T", " "))}</td>
       <td>${r.hits}</td><td>${fmt(r.closest, " m")}</td><td>${fmt(r.max_height, " m")}</td>
       <td>${r.op_lat != null ? `<a style="color:var(--op)" target="_blank"
@@ -509,8 +574,75 @@ async function sendReport(drone) {
 }
 document.addEventListener("click", ev => {
   const b = ev.target.closest(".mail-btn");
-  if (b) { ev.stopPropagation(); sendReport(b.dataset.drone); }
+  if (b) { ev.stopPropagation(); sendReport(b.dataset.drone); return; }
+  if (ev.target.closest("a, .modal")) return;          // links and dialogs handle themselves
+  const entry = ev.target.closest("[data-drone]");
+  if (!entry) return;
+  if (entry.dataset.drone) openDrone(entry.dataset.drone);
+  else if (HAS_MAP && entry.dataset.lat) map.flyTo([+entry.dataset.lat, +entry.dataset.lon], 18);
 });
+
+// ----- Drone dialog: full serial, details, rename -----
+let dmSerial = null;
+function infoRow(k, v) { return v == null || v === "" ? "" : `<tr><td>${esc(k)}</td><td>${v}</td></tr>`; }
+function openDrone(serial) {
+  dmSerial = serial;
+  const d = liveData[serial] || {}, h = histData[serial] || {};
+  const inRange = liveIds.has(serial);
+  $("dm-title").textContent = label(serial);
+  $("dm-name").value = names[serial] || "";
+  $("dm-msg").textContent = ""; $("dm-msg").className = "";
+  $("dm-info").innerHTML = `<h4>DETAILS</h4><table>
+    ${infoRow("Remote ID (full)", `<span class="mono">${esc(serial)}</span>`)}
+    ${infoRow("ID type", esc(d.id_type || h.id_type || ""))}
+    ${infoRow("Maker", esc(d.manufacturer || h.maker || ""))}
+    ${infoRow("Type", esc(d.ua_type || h.ua_type || ""))}
+    ${infoRow("Pilot's note", esc(d.self_id || h.self_id || ""))}
+    ${infoRow("First seen", h.first_seen ? esc(h.first_seen.replace("T", " ")) : "")}
+    ${infoRow("Last seen", h.last_seen ? esc(h.last_seen.replace("T", " ")) : "")}
+    ${infoRow("Log entries", h.hits)}
+    ${infoRow("Closest to home", h.closest != null ? fmt(h.closest, " m") : (d.dist_home_m != null ? fmt(d.dist_home_m, " m") : ""))}
+    ${infoRow("Max height", h.max_height != null ? fmt(h.max_height, " m") : "")}
+    ${infoRow("In range now", inRange ? "yes" : "")}
+  </table>`;
+  const onMap = inRange && d.lat != null && HAS_MAP;
+  $("dm-actions").innerHTML = mailButton(serial) +
+    (onMap ? ` <button class="act-btn plain" id="dm-map">SHOW ON MAP</button>` : "") +
+    (names[serial] ? ` <button class="act-btn plain" id="dm-clear">REMOVE NAME</button>` : "");
+  if (onMap) $("dm-map").onclick = () => { closeDrone(); map.flyTo([d.lat, d.lon], 18); };
+  if (names[serial]) $("dm-clear").onclick = () => renameDrone("");
+  $("drone-modal").classList.add("open");
+  setTimeout(() => $("dm-name").focus(), 50);
+}
+const closeDrone = () => { $("drone-modal").classList.remove("open"); dmSerial = null; };
+$("dm-close").onclick = closeDrone;
+$("drone-modal").onclick = ev => { if (ev.target === $("drone-modal")) closeDrone(); };
+$("dm-save").onclick = () => renameDrone($("dm-name").value);
+$("dm-name").addEventListener("keydown", ev => { if (ev.key === "Enter") renameDrone($("dm-name").value); });
+
+async function renameDrone(name) {
+  const serial = dmSerial; if (!serial) return;
+  name = name.trim();
+  const msg = (t, cls = "") => { $("dm-msg").textContent = t; $("dm-msg").className = cls; };
+  msg("Saving…");
+  try {
+    const r = await (await fetch("?api=rename", { method: "POST",
+      headers: { "Content-Type": "application/json", "X-DroneWatch": "1" },
+      body: JSON.stringify({ drone: serial, name }) })).json();
+    if (r.error) throw new Error(r.error);
+    for (let i = 0; i < 20; i++) {
+      await new Promise(res => setTimeout(res, 1000));
+      const s = await (await fetch("?api=report_status&id=" + r.id, { cache: "no-store" })).json();
+      if (s.pending) continue;
+      if (!s.ok) throw new Error(s.message || "failed");
+      if (name) names[serial] = name; else delete names[serial];
+      poll(); loadHistory();
+      if (dmSerial === serial) { openDrone(serial); msg(name ? "Saved: " + label(serial) : "Name removed", "ok"); }
+      return;
+    }
+    throw new Error("no answer from the scanner");
+  } catch (e) { msg("Not saved: " + e.message, "fail"); }
+}
 
 // ----- Configuration viewer -----
 function cfgSection(title, obj) {
@@ -544,7 +676,7 @@ const closeConfig = () => $("cfg-modal").classList.remove("open");
 $("cfg-open").onclick = showConfig;
 $("cfg-close").onclick = closeConfig;
 $("cfg-modal").onclick = ev => { if (ev.target === $("cfg-modal")) closeConfig(); };
-document.addEventListener("keydown", ev => { if (ev.key === "Escape") closeConfig(); });
+document.addEventListener("keydown", ev => { if (ev.key === "Escape") { closeConfig(); closeDrone(); } });
 
 $("hours").onchange = loadHistory;
 setInterval(() => $("clock").textContent = new Date().toLocaleTimeString(), 1000);

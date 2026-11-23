@@ -1,4 +1,4 @@
-# Drone Watch - systemd service
+# Drone Watch - systemd service (version 1.0.0, last updated 2026-11-22)
 # Install:  sudo cp systemd/drone-watch.service /etc/systemd/system/
 #           sudo systemctl daemon-reload && sudo systemctl enable --now drone-watch
 # Settings (home location, radius, email) are read from /etc/drone_watch.conf.

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: CC-BY-ND-4.0
+# Drone Watch 1.0.0, last updated 2026-11-22
 # Drone Watch settings
 # Copy to /etc/drone_watch.conf and protect it (it holds your mail password):
 #   sudo cp drone_watch.conf.example /etc/drone_watch.conf

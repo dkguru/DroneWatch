@@ -65,6 +65,7 @@ STALE_AFTER = 60                            # seconds before a drone drops off t
 MANUFACTURERS = {
     "1581": "DJI",
     "1748": "Autel Robotics",
+    "1668": "Skydio",
     "1701": "Percepto",
     "1587": "AgEagle",
 }
@@ -217,6 +218,13 @@ def send_email(cfg, subject, body, html_body=None):
         server.send_message(msg)
 
 
+def display_name(name, serial):
+    """'My Skydio 2 (...W52F)' when the drone has a name, otherwise the plain serial."""
+    if name and serial:
+        return f"{name} (...{serial[-4:]})"
+    return serial or name or "unknown"
+
+
 def maps_link(lat, lon):
     return f"https://www.openstreetmap.org/?mlat={lat:.6f}&mlon={lon:.6f}#map=18/{lat:.6f}/{lon:.6f}"
 
@@ -235,8 +243,9 @@ class Alerter:
     for the serial before falling back to the radio MAC address.
     """
 
-    def __init__(self, cfg, db):
+    def __init__(self, cfg, db, names=None):
         a = cfg["alerts"]
+        self.names = names if names is not None else {}   # serial -> name, shared with the Tracker
         self.cfg, self.db = cfg, db
         self.enabled = a.getboolean("enabled")
         self.window = a.getfloat("new_after_minutes") * 60
@@ -289,10 +298,13 @@ class Alerter:
     def _send(self, key, d):
         when = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         maker = d.get("manufacturer") or "Unknown maker"
-        subject = f"Drone over home: {maker} {key} at {datetime.now():%H:%M}"
+        name = self.names.get(key)
+        label = display_name(name, key) if name else f"{maker} {key}"
+        subject = f"Drone over home: {label} at {datetime.now():%H:%M}"
         lines = [
             f"A drone entered your home area at {when}.",
             "",
+            *([f"Name:          {name}"] if name else []),
             f"Remote ID:     {key}  ({d.get('id_type', 'ID type unknown')})",
             f"Maker / type:  {maker} / {d.get('ua_type', '-')}",
             f"Status:        {d.get('status', '-')}",
@@ -346,6 +358,7 @@ def public_config(cfg, path, home, radius, wifi, ble):
 # --------------------------------------------------------------------------
 REQUEST_ID = re.compile(r"[a-f0-9]{24}")
 DRONE_KEY = re.compile(r"[A-Za-z0-9 :._-]{1,40}")
+DRONE_NAME = re.compile(r"[^\x00-\x1f\x7f]{0,40}")     # any printable text, max 40 characters
 REPORTS_PER_HOUR = 20
 
 
@@ -403,6 +416,10 @@ def build_report(db, lock, key, cfg):
         rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     if not rows:
         raise LookupError(f"no sightings logged for {key}")
+    with lock:
+        found = db.execute("SELECT name FROM drone_names WHERE uas_id = ?", (key,)).fetchone()
+    name = found[0] if found else None
+    label = display_name(name, key)
 
     gap = cfg["alerts"].getfloat("new_after_minutes") * 60
     visits = collect_visits(rows, gap)
@@ -415,13 +432,15 @@ def build_report(db, lock, key, cfg):
     notes, op_id, id_type = last("self_id"), last("operator_id"), last("id_type") or "–"
     inside_count = sum(1 for v in visits if v["inside"])
     when = latest["start"].strftime("%a %d %b %Y, %H:%M")
-    subject = f"Drone sighting report: {maker} {key} ({when})"
+    subject = f"Drone sighting report: {label if name else maker + ' ' + key} ({when})"
     dash = cfg["email"].get("dashboard_url")
     now_txt = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     # ---------- plain-text version ----------
-    t = [f"DRONE WATCH - SIGHTING REPORT ({now_txt})", "",
-         f"Remote ID:    {key} ({id_type})", f"Maker/type:   {maker} / {ua_type}"]
+    t = [f"DRONE WATCH - SIGHTING REPORT ({now_txt})", ""]
+    if name:
+        t.append(f"Name:         {name}")
+    t += [f"Remote ID:    {key} ({id_type})", f"Maker/type:   {maker} / {ua_type}"]
     if notes:
         t.append(f"Pilot's note: {notes}")
     if op_id:
@@ -488,6 +507,7 @@ def build_report(db, lock, key, cfg):
             if len(previous) > 50 else "")
 
     details = "".join([
+        kv("Name", f'<b>{E(name)}</b>') if name else "",
         kv("Remote ID", f'<b style="font-family:Menlo,Consolas,monospace">{E(key)}</b> <span style="color:{dim}">({E(id_type)})</span>'),
         kv("Maker / type", E(f"{maker} / {ua_type}")),
         kv("Pilot's note", E(notes)) if notes else "",
@@ -504,7 +524,7 @@ def build_report(db, lock, key, cfg):
   <tr><td style="background:#070b0d;padding:22px 28px">
     <div style="color:#2ef2b4;font-size:12px;letter-spacing:4px">&#9673; DRONE WATCH</div>
     <div style="color:#ffffff;font-size:22px;font-weight:600;margin-top:6px">Sighting report</div>
-    <div style="color:#8fa9a5;font-size:13px;margin-top:4px">{E(maker)} &middot; {E(key)} &middot; generated {E(now_txt)}</div>
+    <div style="color:#8fa9a5;font-size:13px;margin-top:4px">{E(label if name else maker + " · " + key)} &middot; generated {E(now_txt)}</div>
   </td></tr>
   <tr><td style="padding:22px 28px 6px">{badge}
     <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-top:14px">{details}</table>
@@ -585,6 +605,9 @@ class ReportService:
             if not isinstance(key, str) or not DRONE_KEY.fullmatch(key):
                 self._result(rid, False, "invalid drone id")
                 continue
+            if req.get("type") == "rename":
+                self._rename(rid, key, req.get("name", ""))
+                continue
             now = time.time()
             self.sent = [t for t in self.sent if now - t < 3600]
             if len(self.sent) >= REPORTS_PER_HOUR:
@@ -593,6 +616,15 @@ class ReportService:
             self.sent.append(now)
             threading.Thread(target=self._send, args=(rid, key), daemon=True).start()
         self._clean_results()
+
+    def _rename(self, rid, key, name):
+        if not isinstance(name, str) or not DRONE_NAME.fullmatch(name.strip()):
+            self._result(rid, False, "names can be up to 40 characters, without control characters")
+            return
+        name = name.strip()
+        self.tracker.set_name(key, name)
+        print(f"[name] {key} -> {name or '(name removed)'}", flush=True)
+        self._result(rid, True, display_name(name, key) if name else f"name removed from {key}")
 
     def _send(self, rid, key):
         try:
@@ -639,11 +671,27 @@ class Tracker:
             alt_geo_m REAL, height_m REAL, speed_ms REAL, heading REAL,
             op_lat REAL, op_lon REAL, operator_id TEXT, self_id TEXT,
             dist_home_m REAL, inside_radius INTEGER)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS drone_names (
+            uas_id TEXT PRIMARY KEY, name TEXT NOT NULL, updated TEXT)""")
         self.db.commit()
         os.chmod(db_path, 0o644)  # let the web server read it
         self._last_log = {}
-        self.alerter = Alerter(cfg or load_config(None), self.db)
+        self.names = dict(self.db.execute("SELECT uas_id, name FROM drone_names"))
+        self.alerter = Alerter(cfg or load_config(None), self.db, self.names)
         self.public_config = {}      # safe copy of the settings for the dashboard (no password)
+
+    def set_name(self, serial, name):
+        """Give a drone a friendly name (empty name removes it)."""
+        with self.lock:
+            if name:
+                self.db.execute("INSERT INTO drone_names VALUES (?,?,?) ON CONFLICT(uas_id) "
+                                "DO UPDATE SET name = excluded.name, updated = excluded.updated",
+                                (serial, name, datetime.now().isoformat(timespec="seconds")))
+                self.names[serial] = name
+            else:
+                self.db.execute("DELETE FROM drone_names WHERE uas_id = ?", (serial,))
+                self.names.pop(serial, None)
+            self.db.commit()
 
     def update(self, mac, source, rssi, fields):
         if not fields:
@@ -677,7 +725,8 @@ class Tracker:
         """Heartbeat + live drone list for the web dashboard (atomic write)."""
         now = time.time()
         with self.lock:
-            live = [dict(d, age=round(now - d["last_seen"], 1)) for d in self.drones.values()
+            live = [dict(d, age=round(now - d["last_seen"], 1), name=self.names.get(d.get("uas_id")))
+                    for d in self.drones.values()
                     if now - d["last_seen"] < STALE_AFTER]
         status = {"heartbeat": now, "started": self.started, "pid": os.getpid(),
                   "sources": sources, "home": self.home, "radius": self.radius,
@@ -706,7 +755,8 @@ class Tracker:
             h = f"{d['height_m']:.0f}m" if d.get("height_m") is not None else "-"
             s = f"{d['speed_ms']:.1f}" if d.get("speed_ms") is not None else "-"
             dist = f"{d['dist_home_m']:.0f}m" if d.get("dist_home_m") is not None else "-"
-            print(f"{flag}{d.get('uas_id', '(waiting)')[:21]:<22}{d.get('manufacturer', '-')[:9]:<10}"
+            label = display_name(self.names.get(d.get("uas_id")), d.get("uas_id")) if d.get("uas_id") else "(waiting)"
+            print(f"{flag}{label[:21]:<22}{d.get('manufacturer', '-')[:9]:<10}"
                   f"{d.get('status', '-')[:9]:<10}{h:>7}{s:>7}{dist:>7}  {pos:<22}{op:<22}{d.get('rssi', 0):>5}")
             if d.get("self_id") or d.get("operator_id"):
                 print(f"    note: {d.get('self_id', '')}  operator ID: {d.get('operator_id', '-')}")

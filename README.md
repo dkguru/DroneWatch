@@ -15,6 +15,7 @@ the police or the FAA.
 | `LICENSE` | CC BY-ND 4.0 license. |
 
 Repository: https://github.com/dkguru/DroneWatch
+Version: **1.0.0**, last updated 2026-11-22.
 Authors: Kianna Angelo and Jesper Angelo, kj@angelo.net. Idea by Kianna Angelo.
 Copyright notice: https://dkguru.wordpress.com/copyright/
 License: [CC BY-ND 4.0](https://creativecommons.org/licenses/by-nd/4.0/). See section 10.
@@ -518,6 +519,7 @@ sudo systemctl reload apache2
 |---|---|
 | Watch live | Open `http://<pi-address>/`. Drones inside your radius are red. Tap a contact to zoom to it. |
 | Email a report on a drone | Click **✉ EMAIL REPORT** next to the drone, in the live list or the history table. See 7.2. |
+| Name a drone | Click the drone in the live list or the history table, type a name, and click **SAVE**. See 7.4. |
 | Check the settings | Click **SHOW CONFIGURATION** at the bottom of the dashboard. See 7.3. |
 | History in the terminal | `sudo python3 /opt/drone_watch/drone_watch.py --report` |
 | Only drones that came inside the radius | add `--inside-only` |
@@ -618,7 +620,39 @@ The scanner publishes these settings in `status.json`, with the password
 removed. To change a setting, edit `/etc/drone_watch.conf` and restart the
 scanner.
 
-### 7.4 Reporting a drone
+### 7.4 Naming drones
+
+Drones you recognize, such as your own, a neighbor's or a regular visitor,
+can be given a name. A named drone shows as **name (...last 4 characters of
+the serial)**, for example `My Skydio 2 (...W52F)`. This label appears in:
+
+- the live list, the map and the history table
+- the drone details window
+- alert emails and sighting reports
+
+To name a drone, **click it** in the live list or the history table. This
+opens its details window, which shows:
+
+- the full Remote ID serial and the maker
+- first and last seen, the number of log entries, closest distance and
+  maximum height
+- an **EMAIL REPORT** button, and **SHOW ON MAP** if the drone is in range now
+
+Type a name of up to 40 characters, then click **SAVE** or press Enter. To
+remove a name, click **REMOVE NAME**.
+
+The full serial is never hidden:
+- it appears in small type under the name in the live list
+- it appears when you hover over a history row
+- it appears in the details window
+- emails show both the name and the full Remote ID
+
+Names are stored by the scanner in the `drone_names` table of the database.
+Like the report button, the dashboard sends a request that the scanner
+carries out, so the web page never writes to the database itself. The scanner
+must be running to rename a drone.
+
+### 7.5 Reporting a drone
 
 1. Filter the history to the period in question and export the CSV.
 2. Note the drone's **Remote ID serial**, the dates and times, the closest
@@ -644,6 +678,7 @@ scanner.
 | Map is grey | The browser has no internet access. The map tiles load from the internet. |
 | EMAIL REPORT says *report queue not available* | Restart the scanner (`sudo systemctl restart drone-watch`). It creates the queue folders when it starts. |
 | EMAIL REPORT says ✕ FAILED | Hover over the button for the reason, or check `journalctl -u drone-watch \| grep report`. Mail problems are the same as for alerts (below). |
+| Footer says *⚠ versions differ* | The dashboard (`/var/www/html/index.php`) and the scanner (`/opt/drone_watch/drone_watch.py`) are from different releases, usually because only one was copied or a copy was cut short. Copy both again and restart the scanner. `python3 /opt/drone_watch/drone_watch.py --version` shows the scanner's version. |
 | No alert emails | Run `--test-email`. Check `journalctl -u drone-watch \| grep alert`. Gmail needs an App Password (see 6.3.1). Check that `enabled = yes`. |
 | Home location didn't change | Edit `/etc/drone_watch.conf`, then `sudo systemctl restart drone-watch`. A `--home` in the service file overrides the config file. |
 
