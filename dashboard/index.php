@@ -3,6 +3,7 @@
 // Copyright (c) 2026 Kianna Angelo and Jesper Angelo <kj@angelo.net>
 // Idea by Kianna Angelo
 // https://github.com/dkguru/DroneWatch
+// Version 1.0.0, last updated 2026-11-22
 /*
  * Drone Watch dashboard - live web view of drone_watch.py
  *
@@ -15,6 +16,9 @@
  *   index.php?api=history  -> JSON summary of the last N hours (default 24)
  *   index.php?api=csv      -> CSV export of every sighting (evidence file)
  */
+
+const DASHBOARD_VERSION = '1.0.0';
+const DASHBOARD_UPDATED = '2026-11-22';
 
 $DATA_DIR    = getenv('DRONE_WATCH_DIR') ?: '/var/lib/drone_watch';
 $DB_PATH     = "$DATA_DIR/drone_watch.db";
@@ -291,6 +295,8 @@ if ($api === 'csv') {
                   padding: 3px 8px; font: inherit; font-size: 11px; text-decoration: none; }
   footer { padding: 4px 22px 22px; color: var(--dim); font-size: 11px; }
   .copyright { margin-top: 10px; font-size: 10px; opacity: .6; letter-spacing: .03em; }
+  .versions { margin-top: 3px; font-size: 10px; opacity: .6; letter-spacing: .03em; }
+  .versions .warn { color: var(--warn); opacity: 1; }
   .copyright a { color: inherit; }
   .leaflet-container { font: inherit; background: #000; }
   .dark-tiles { filter: invert(1) hue-rotate(180deg) brightness(.85) contrast(.9) saturate(.6); }
@@ -342,6 +348,8 @@ location to local police, who can query the FAA. Rows in red came inside your al
 <div class="copyright">© 2026 Kianna Angelo and Jesper Angelo · Idea by Kianna Angelo ·
 <a href="https://creativecommons.org/licenses/by-nd/4.0/" target="_blank" rel="noopener">CC BY-ND 4.0</a> ·
 <a href="https://github.com/dkguru/DroneWatch" target="_blank" rel="noopener">github.com/dkguru/DroneWatch</a></div>
+<div class="versions">Dashboard v<?= DASHBOARD_VERSION ?> (updated <?= DASHBOARD_UPDATED ?>) ·
+  Scanner <span id="scanner-ver">v? (not reported)</span><span id="ver-warn"></span></div>
 <button class="cfg-btn" id="cfg-open">SHOW CONFIGURATION</button>
 </footer>
 
@@ -498,6 +506,7 @@ async function poll() {
     } else {
       $("sub").textContent = "no status file — is drone_watch.py running?";
     }
+    if (s) showVersions(s);
     if (r.today) {
       $("s-intr").textContent = r.today.intrusions ?? 0;
       $("s-today").textContent = r.today.drones ?? 0;
@@ -531,6 +540,15 @@ async function loadHistory() {
       <td>${esc(r.self_id || "")}</td>
       <td>${mailButton(r.uas_id)}</td>
     </tr>`).join("") : `<tr><td colspan="11" class="empty">Nothing logged in this period</td></tr>`;
+}
+
+// ----- Version line in the footer -----
+const DASHBOARD_VERSION = <?= json_encode(DASHBOARD_VERSION) ?>;
+function showVersions(s) {
+  $("scanner-ver").textContent = s.version
+    ? `v${s.version} (updated ${s.updated})` : "v? (older version, does not report it)";
+  $("ver-warn").innerHTML = s.version === DASHBOARD_VERSION ? ""
+    : ` · <span class="warn">⚠ versions differ: update both files on the Pi</span>`;
 }
 
 // ----- Email report buttons -----

@@ -3,6 +3,7 @@
 # Copyright (c) 2026 Kianna Angelo and Jesper Angelo <kj@angelo.net>
 # Idea by Kianna Angelo
 # https://github.com/dkguru/DroneWatch
+# Version 1.0.0, last updated 2026-11-22
 """
 drone_watch.py - Remote ID drone monitor for Raspberry Pi.
 
@@ -29,6 +30,9 @@ Usage:
   sudo python3 drone_watch.py --test-email           # check the email settings
   python3 drone_watch.py --report                    # show history
 """
+
+__version__ = "1.0.0"
+__updated__ = "2026-11-22"
 
 import argparse
 import asyncio
@@ -730,7 +734,8 @@ class Tracker:
                     if now - d["last_seen"] < STALE_AFTER]
         status = {"heartbeat": now, "started": self.started, "pid": os.getpid(),
                   "sources": sources, "home": self.home, "radius": self.radius,
-                  "drones": live, "config": self.public_config}
+                  "drones": live, "config": self.public_config,
+                  "version": __version__, "updated": __updated__}
         tmp = STATUS_PATH + ".tmp"
         with open(tmp, "w") as f:
             json.dump(status, f)
@@ -832,6 +837,7 @@ def main():
     ap.add_argument("--home", help="property centre as lat,lon (overrides the config file)")
     ap.add_argument("--radius", type=float, help="home radius in metres (overrides the config file)")
     ap.add_argument("--test-email", action="store_true", help="send a test email and exit")
+    ap.add_argument("--version", action="version", version=f"Drone Watch {__version__} ({__updated__})")
     ap.add_argument("--wifi", help="monitor-mode Wi-Fi interface, e.g. wlan1")
     ap.add_argument("--no-ble", action="store_true", help="disable Bluetooth scanning")
     ap.add_argument("--report", action="store_true", help="print history from the database")
@@ -863,6 +869,7 @@ def main():
     tracker = Tracker(home, radius, DB_PATH, cfg)
     tracker.public_config = public_config(cfg, a.config, home, radius, a.wifi, not a.no_ble)
     reports = ReportService(tracker, cfg)
+    print(f"Drone Watch {__version__} ({__updated__})", flush=True)
     print(f"Home {home}, radius {radius} m, email alerts "
           f"{'ON' if tracker.alerter.enabled else 'off'} "
           f"(new after {tracker.alerter.window / 60:g} min)", flush=True)
