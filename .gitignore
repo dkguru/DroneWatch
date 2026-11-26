@@ -1,3 +1,6 @@
+# Claude's private working notes for this project - local only, never commit
+CLAUDE-MEMORY.md
+
 # Your real settings (contains your mail password and home location) - never commit
 drone_watch.conf
 /etc/

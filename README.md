@@ -234,6 +234,32 @@ avoids running another server process on the Pi.
 
 ---
 
+### Lessons learned while building it
+
+- **The web page must not hold secrets.** The first idea was for PHP to send
+  report emails, but that would have needed the mail password readable by the
+  web server. Instead, the scanner does all sending and writing, and the
+  dashboard only drops requests in a drop-box folder (`requests/`). Renames
+  use the same path.
+- **Report failures in the page, not only in a log.** The original dashboard
+  showed only "can't reach the server" when PHP crashed, which hid a missing
+  `php-sqlite3` driver. The API now returns errors as JSON and the page shows
+  them.
+- **Don't depend on a free service staying free.** CARTO's dark map tiles
+  started requiring an API key. The dashboard now uses OpenStreetMap tiles
+  with a CSS filter. It also keeps working if the map library can't load.
+- **Python version.** Raspberry Pi OS Bookworm has Python 3.11, which does
+  not allow backslashes inside f-string expressions (3.12 does). The code is
+  checked to compile on Python 3.9 to 3.13.
+- **Make version drift visible.** The dashboard compares its own version with
+  the one the scanner reports, because a half-copied or forgotten file was the
+  most common problem.
+- **Serial first, MAC as fallback.** Remote ID location messages often arrive
+  before the serial. Alerts wait up to 15 s for the serial, so one drone
+  doesn't produce two emails.
+- **Restarts must not repeat alerts.** Recent visits are read back from the
+  log at startup.
+
 ## 5. Hardware
 
 | Part | Notes |
@@ -241,7 +267,7 @@ avoids running another server process on the Pi.
 | Raspberry Pi 4 or 5 (a 3B+ works) | Built-in Bluetooth is enough for BLE Remote ID |
 | microSD card, 32 GB or more, good quality | Endurance cards last longer with constant logging |
 | Official power supply | Undervoltage causes Bluetooth and USB dropouts |
-| *Optional:* USB Wi-Fi adapter with monitor mode | E.g. Alfa AWUS036ACM (MT7612U) or another MT7612U/MT7610U adapter. Needed for Wi-Fi Remote ID. |
+| *Optional:* USB Wi-Fi adapter with monitor mode | Needed for Wi-Fi Remote ID. Tested: TP-Link Archer T4U v3 (RTL8812BU, in-kernel driver, appears as `wlan1`). Also known to work: Alfa AWUS036ACM and other MT7612U/MT7610U adapters. The Pi's built-in `wlan0` cannot do monitor mode. |
 | *Optional:* external antenna / USB Bluetooth 5 dongle | Adds range. Place the Pi high, near a window or in a weatherproof box outdoors. |
 
 Typical reception range is a few hundred meters for BLE and more for Wi-Fi,
@@ -513,6 +539,69 @@ sudo systemctl reload apache2
 
 ---
 
+### 6.8 Updating the Pi to a new version
+
+Most problems during development came from the Pi running a different file
+than intended: a copy cut short, an old copy, or only one of the two programs
+updated. Follow these steps for every update.
+
+**1. Get the files onto the Pi byte for byte.** The best way is Git, on the Pi:
+
+```bash
+cd ~/DroneWatch && git pull
+```
+
+From a Windows PC, `scp` also works:
+
+```powershell
+scp drone_watch.py dashboard\index.php pi@<pi-address>:~/DroneWatch/
+```
+
+Never paste a program into `nano`. Long files get cut off, which happened
+here at line 529 of 843, and the scanner then crashes on start with
+`SyntaxError: unterminated triple-quoted f-string literal`.
+
+**2. Check the files before installing them:**
+
+```bash
+wc -l ~/DroneWatch/drone_watch.py                   # compare with the line count in the release notes / your PC
+python3 -m py_compile ~/DroneWatch/drone_watch.py && echo OK
+grep -c DASHBOARD_VERSION ~/DroneWatch/index.php    # 0 = old dashboard
+```
+
+**3. Install both programs and restart:**
+
+```bash
+sudo cp ~/DroneWatch/drone_watch.py /opt/drone_watch/
+sudo cp ~/DroneWatch/index.php /var/www/html/index.php
+sudo systemctl restart drone-watch
+python3 /opt/drone_watch/drone_watch.py --version
+journalctl -u drone-watch -n 5
+```
+
+**4. Reload the dashboard with Ctrl+F5.** The footer shows both versions.
+A yellow **⚠ versions differ** means one of the two files is still old.
+
+**Check the source too.** If the Pi still shows the old version after a
+careful copy, the copy on your PC may be old. Files in a OneDrive folder can
+be put back to an older version by sync, and Git commands such as `checkout`
+and `stash` replace files. Run `git status` and `git log -1` on the PC, and
+check the version near the top of each file, before copying.
+
+**Releasing a new version.** Change the version and date in both programs
+together:
+- `__version__` and `__updated__` near the top of `drone_watch.py`
+- `DASHBOARD_VERSION` and `DASHBOARD_UPDATED` in `index.php`
+- the "Version" lines in the other files' headers
+
+Then commit, tag and push:
+
+```bash
+git commit -am "Version X.Y.Z: ..."
+git tag vX.Y.Z
+git push --follow-tags
+```
+
 ## 7. Using it
 
 | Task | How |
@@ -680,6 +769,15 @@ must be running to rename a drone.
 | EMAIL REPORT says ✕ FAILED | Hover over the button for the reason, or check `journalctl -u drone-watch \| grep report`. Mail problems are the same as for alerts (below). |
 | Footer says *⚠ versions differ* | The dashboard (`/var/www/html/index.php`) and the scanner (`/opt/drone_watch/drone_watch.py`) are from different releases, usually because only one was copied or a copy was cut short. Copy both again and restart the scanner. `python3 /opt/drone_watch/drone_watch.py --version` shows the scanner's version. |
 | No alert emails | Run `--test-email`. Check `journalctl -u drone-watch \| grep alert`. Gmail needs an App Password (see 6.3.1). Check that `enabled = yes`. |
+| Scanner restarts every few seconds with `SyntaxError` | The installed `drone_watch.py` is cut short. Compare `wc -l /opt/drone_watch/drone_watch.py` with the original, then copy it again with `git pull` or `scp` (see 6.8). |
+| `--version` gives *unrecognized arguments* | The installed scanner is older than 1.0.0. Install the new one (see 6.8). |
+| PHP log: *could not find driver* | `sudo apt install php-sqlite3 && sudo systemctl restart apache2`. Without the SQLite driver, the dashboard shows "server error" and OFFLINE even though the scanner runs. |
+| Map shows *API KEY REQUIRED* tiles | An old dashboard that still uses CARTO tiles. Install the current `index.php`, which uses OpenStreetMap. |
+| Map area says *Map unavailable* | The browser could not load the Leaflet library from unpkg.com. The rest of the dashboard still works. |
+| Service fails: *iw ... Operation not supported (-95)* | A Wi-Fi line in the service file names `wlan0`, the built-in chip, which cannot do monitor mode. Use the USB adapter (`wlan1`) in every line, and keep the `-` after `=` so Bluetooth still starts if Wi-Fi setup fails. |
+| systemd: *bad unit file setting* | The service file was damaged when pasted. Copy `systemd/drone-watch.service` from the repository, then run `sudo systemd-analyze verify /etc/systemd/system/drone-watch.service`. |
+| Git on Windows: *index.lock: File exists* | An earlier Git command was interrupted. Delete `.git\index.lock` and run the command again. |
+| Push rejected: *non-fast-forward* on the first push | GitHub created starter files (README, LICENSE). Run `git fetch`, then `git push --force-with-lease -u origin main` to replace them, or merge with `--allow-unrelated-histories`. |
 | Home location didn't change | Edit `/etc/drone_watch.conf`, then `sudo systemctl restart drone-watch`. A `--home` in the service file overrides the config file. |
 
 ---
